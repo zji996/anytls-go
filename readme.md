@@ -53,6 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bo
 - 执行 `go mod download` 预下载依赖。
 - 从 `zji-dev` 源码构建 `anytls-server`。
 - 写入 systemd service 并启动服务。
+- 尝试通过本机 `ufw`、`firewalld` 或 `iptables` 放行监听端口。
 - 执行部署自检，检查服务状态、监听端口和 fallback 目标。
 - 输出可复制到 sing-box、Shadowrocket 等客户端的 AnyTLS URI。
 
@@ -72,7 +73,7 @@ sudo /opt/anytls-go/scripts/install-anytls-server.sh
 
 菜单支持安装/重装、更新 `zji-dev` 并重启、查看状态和客户端 URI、自检、重启、卸载。
 
-安装完成后，需要在云厂商安全组或服务器防火墙放行对应 TCP 端口。
+安装脚本会尽量自动放行服务器本机防火墙，但云厂商安全组或供应商防火墙仍需要在控制台放行对应 TCP 端口。
 
 ### 示例服务器
 

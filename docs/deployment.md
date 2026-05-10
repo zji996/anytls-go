@@ -34,6 +34,7 @@ curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bo
 - clone 或更新 `https://github.com/zji996/anytls-go.git` 的 `zji-dev` 分支到 `/opt/anytls-go`。
 - 执行 `go mod download`，提前下载 Go modules。
 - 启动菜单式服务端管理器，现场构建并安装 `anytls-server`。
+- 尝试通过本机防火墙放行监听端口。
 - 安装完成后执行自检，显示服务状态、监听端口、fallback 状态和客户端 URI。
 
 默认交互项尽量少：
@@ -91,6 +92,7 @@ sudo ./scripts/install-anytls-server.sh -p '你的密码' -l 0.0.0.0:8443 -s you
 - `--fallback`：认证失败时反代的地址，默认 `127.0.0.1:80`。
 - `--binary`：使用已有 `anytls-server` 二进制安装，跳过服务器现场编译。
 - `--padding-scheme`：可选，安装自定义 PaddingScheme 文件。
+- `--no-firewall`：不自动修改本机防火墙规则。
 - `--non-interactive`：不提示输入；未传密码时自动生成随机密码。
 
 脚本会安装：
@@ -118,7 +120,13 @@ sudo journalctl -u anytls-server -f
 - 重启服务。
 - 卸载服务和配置。
 
-安装后还需要在云厂商安全组或本机防火墙放行对应 TCP 端口。
+安装脚本会尽量自动放行本机防火墙：
+
+- `ufw` 已启用时执行 `ufw allow PORT/tcp`。
+- `firewalld` 已运行时执行永久端口规则并 reload。
+- 没有 `ufw` / `firewalld` 但存在 `iptables` 时，添加运行时 ACCEPT 规则；这类规则可能不会在重启后保留。
+
+云厂商安全组或供应商防火墙无法从 VPS 内可靠修改，仍需要在控制台手动放行对应 TCP 端口。若不希望脚本修改本机防火墙，可加 `--no-firewall`。
 
 ## 现场编译还是拷贝二进制
 

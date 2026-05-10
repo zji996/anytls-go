@@ -31,6 +31,7 @@ Options for install/update:
       --branch BRANCH           Expected source branch. Default: zji-dev
       --binary FILE             Existing anytls-server binary to install instead of building.
       --padding-scheme FILE     Optional PaddingScheme file.
+      --no-firewall             Do not try to open the listen port in local firewall.
       --non-interactive         Do not prompt; generate a password if missing.
   -h, --help                    Show this help.
 USAGE
@@ -46,6 +47,7 @@ binary_path=""
 expected_branch="$default_branch"
 non_interactive=0
 fallback_arg_set=0
+auto_firewall=1
 
 if [[ $# -gt 0 ]]; then
   case "$1" in
@@ -89,6 +91,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --non-interactive)
       non_interactive=1
+      shift
+      ;;
+    --no-firewall)
+      auto_firewall=0
       shift
       ;;
     -h|--help)
@@ -355,12 +361,61 @@ client_uri() {
   echo "anytls://$encoded_password@$host:$port/?insecure=1"
 }
 
+listen_port() {
+  local addr="$1"
+  if [[ "$addr" == *"]:"* ]]; then
+    printf "%s" "${addr##*:}"
+  else
+    printf "%s" "${addr##*:}"
+  fi
+}
+
+open_firewall_port() {
+  local port="$1"
+  if [[ -z "$port" ]]; then
+    echo "firewall: listen port is empty, skip"
+    return
+  fi
+  if [[ "$auto_firewall" -ne 1 ]]; then
+    echo "firewall: skipped by --no-firewall"
+    return
+  fi
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    echo "firewall: opening tcp/$port with ufw"
+    ufw allow "$port/tcp"
+    return
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    echo "firewall: opening tcp/$port with firewalld"
+    firewall-cmd --permanent --add-port="$port/tcp"
+    firewall-cmd --reload
+    return
+  fi
+
+  if command -v iptables >/dev/null 2>&1; then
+    if iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+      echo "firewall: iptables already allows tcp/$port"
+    else
+      echo "firewall: opening tcp/$port with iptables runtime rule"
+      iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+      echo "firewall: iptables runtime rules may not persist after reboot"
+    fi
+    return
+  fi
+
+  echo "firewall: no supported local firewall tool detected; remember to open tcp/$port in provider firewall/security group"
+}
+
 print_summary() {
+  local port
+  port="$(listen_port "$listen_addr")"
   echo
   echo "anytls-server is installed and started."
   echo "service: sudo systemctl status $service_name"
   echo "logs:    sudo journalctl -u $service_name -f"
-  echo "port:    ${listen_addr##*:}/tcp must be open in your cloud firewall/security group."
+  echo "port:    $port/tcp must be open in your cloud firewall/security group."
   if [[ -n "$fallback_addr" ]]; then
     echo "fallback: invalid AnyTLS traffic is forwarded to $fallback_addr."
   fi
@@ -389,6 +444,43 @@ check_listen_port() {
   else
     echo "  skip: ss not found, cannot check listening port"
   fi
+}
+
+check_firewall_port() {
+  local port="$1"
+  if [[ -z "$port" ]]; then
+    echo "  skip: listen port is empty"
+    return
+  fi
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ufw status numbered 2>/dev/null | grep -Eq "(^|[^0-9])${port}/tcp[[:space:]]+ALLOW"; then
+      echo "  ok: ufw allows tcp/$port"
+    else
+      echo "  warn: ufw is active but tcp/$port is not explicitly allowed"
+    fi
+    return
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    if firewall-cmd --query-port="$port/tcp" >/dev/null 2>&1; then
+      echo "  ok: firewalld allows tcp/$port"
+    else
+      echo "  warn: firewalld is active but tcp/$port is not allowed"
+    fi
+    return
+  fi
+
+  if command -v iptables >/dev/null 2>&1; then
+    if iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+      echo "  ok: iptables has runtime ACCEPT rule for tcp/$port"
+    else
+      echo "  info: no explicit iptables ACCEPT rule found for tcp/$port"
+    fi
+    return
+  fi
+
+  echo "  info: no supported local firewall tool detected"
 }
 
 check_fallback() {
@@ -456,6 +548,13 @@ run_doctor() {
   if [[ -n "$current_port" ]]; then
     check_listen_port "$current_port"
   fi
+  echo
+  echo "Firewall:"
+  if [[ -n "$current_port" ]]; then
+    check_firewall_port "$current_port"
+  fi
+  echo
+  echo "Fallback:"
   check_fallback
   echo
   echo "Client URI:"
@@ -471,6 +570,7 @@ install_or_update() {
   install -d -m 0755 "$config_dir"
   build_or_install_binary
   write_service_files
+  open_firewall_port "$(listen_port "$listen_addr")"
   systemctl daemon-reload
   systemctl enable --now "$service_name"
   systemctl restart "$service_name"

@@ -55,6 +55,7 @@ sudo /opt/anytls-go/scripts/install-anytls-server.sh doctor
 - 服务端支持认证失败 fallback。
 - 服务端支持明文 TCP 探测 fallback，首包会转发到 fallback 后端。
 - 部署脚本支持 TUI 菜单、随机密码、状态查看、更新、卸载和 `doctor` 自检。
+- 部署脚本会尝试自动放行本机防火墙监听端口，并在 `doctor` 中检查规则状态。
 - 提供客户端侧 AnyTLS/Vision 对比脚本，方便在同一台 VPS 上实测首包和吞吐差异。
 
 ## 已验证项目
@@ -92,7 +93,7 @@ AnyTLS 与 Vision 的真实速度差异需要从客户端侧连接同一台 VPS 
 - 还没有实现加载正式 TLS 证书的服务端参数。
 - 自签证书是进程启动时生成的短期证书，不是自动续签的正式证书机制。
 - fallback 默认只负责转发；如果要让主动探测看到正常网页，需要在本机 `127.0.0.1:80` 运行 nginx、Caddy 或其他 HTTP 服务。
-- 脚本不会自动修改云厂商安全组；需要手动放行服务端 TCP 端口。
+- 脚本无法自动修改云厂商安全组；需要手动放行服务端 TCP 端口。
 - Xray 当前不能把 AnyTLS 作为原生协议直接使用，可通过本机 SOCKS/HTTP 与 `anytls-client` 组合。
 
 ## 上线前建议
