@@ -69,6 +69,8 @@ cmdSYNACK 若不带有 data，则表示代理 stream 握手成功。若带有 da
 
 本命令的 data 承载 Stream 的传输数据。
 
+由于 frame 的 `data length` 字段为 `uint16`，单个 `cmdPSH` 最多承载 65535 字节。实现方收到来自本地 `Stream.Write` 的更大数据块时，必须拆分为多个 `cmdPSH` 发送；接收方按同一 streamId 顺序交付即可。
+
 #### cmdFIN
 
 通知对方关闭对应 streamId 的 Stream。
@@ -245,3 +247,15 @@ anytls 协议参数不包括 TLS 的参数。应该在另外的配置分区中�
 ### 协议版本 2 - v0.0.10 - 2025 年 9 月
 
 明确 `cmdFIN` 与 Session / Stream 关闭的行为。
+
+### 实现兼容性说明
+
+`anytls-go` 的 zji-dev 分支保持 wire format 兼容：frame 头格式、command 编号、`cmdSettings`/`cmdServerSettings` 字段、PaddingScheme 语法和 v1/v2 协商规则均不改变。
+
+当前分支只做内部兼容性修复：
+
+- `Stream.Write` 超过 65535 字节时拆分为多个 `cmdPSH`，避免 `uint16` 长度截断。
+- 客户端在发送 `cmdSYN` 前先注册本地 stream，避免服务器快速返回 `cmdSYNACK` 时丢失状态。
+- `cmdUpdatePaddingScheme` 更新 Client 级别的 padding factory，不再污染进程全局默认 padding。
+- 控制帧写超时与底层写入在同一写锁内执行，避免连接级 deadline 影响并发数据帧写入。
+- 接收侧使用每 stream 有界队列解耦，减少慢 reader 对其他 stream 的影响；队列满后仍通过 TCP 背压限制内存增长。

@@ -9,6 +9,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/sagernet/sing/common/atomic"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 )
@@ -16,13 +17,15 @@ import (
 type myClient struct {
 	dialOut       util.DialOutFunc
 	sessionClient *session.Client
+	padding       *atomic.TypedValue[*padding.PaddingFactory]
 }
 
 func NewMyClient(ctx context.Context, dialOut util.DialOutFunc, minIdleSession int) *myClient {
 	s := &myClient{
 		dialOut: dialOut,
+		padding: padding.NewDefaultPaddingFactory(),
 	}
-	s.sessionClient = session.NewClient(ctx, s.createOutboundConnection, &padding.DefaultPaddingFactory, time.Second*30, time.Second*30, minIdleSession)
+	s.sessionClient = session.NewClient(ctx, s.createOutboundConnection, s.padding, time.Second*30, time.Second*30, minIdleSession)
 	return s
 }
 
@@ -50,7 +53,7 @@ func (c *myClient) createOutboundConnection(ctx context.Context) (net.Conn, erro
 
 	b.Write(passwordSha256)
 	var paddingLen int
-	if pad := padding.DefaultPaddingFactory.Load().GenerateRecordPayloadSizes(0); len(pad) > 0 {
+	if pad := c.padding.Load().GenerateRecordPayloadSizes(0); len(pad) > 0 {
 		paddingLen = pad[0]
 	}
 	binary.BigEndian.PutUint16(b.Extend(2), uint16(paddingLen))

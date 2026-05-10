@@ -8,8 +8,10 @@ import (
 	"crypto/tls"
 	"flag"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
@@ -21,18 +23,28 @@ func main() {
 	listen := flag.String("l", "127.0.0.1:1080", "socks5 listen port")
 	serverAddr := flag.String("s", "", "Server address or anytls:// link")
 	sni := flag.String("sni", "", "Server Name Indication")
+	insecure := flag.Bool("insecure", true, "Allow insecure TLS connection")
 	password := flag.String("p", "", "Password")
 	minIdleSession := flag.Int("m", 5, "Reserved min idle session")
 	flag.Parse()
 
 	if serverURL, err := url.Parse(*serverAddr); err == nil {
 		if serverURL.Scheme == "anytls" {
-			*serverAddr = serverURL.Host
+			*serverAddr = withDefaultPort(serverURL.Host, "443")
 			if serverURL.User != nil {
 				*password = serverURL.User.String()
 			}
 			query := serverURL.Query()
 			*sni = query.Get("sni")
+			if rawInsecure := query.Get("insecure"); rawInsecure != "" {
+				if parsed, err := strconv.ParseBool(rawInsecure); err == nil {
+					*insecure = parsed
+				} else if rawInsecure == "1" {
+					*insecure = true
+				} else if rawInsecure == "0" {
+					*insecure = false
+				}
+			}
 		}
 	}
 
@@ -68,11 +80,17 @@ func main() {
 	// You can only use `InsecureSkipVerify` by default in the sample client; it is not recommended for use in production code.
 	tlsConfig := &tls.Config{
 		ServerName:         *sni,
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: *insecure,
 	}
 	if tlsConfig.ServerName == "" {
 		// disable the SNI
 		tlsConfig.ServerName = "127.0.0.1"
+	} else if _, err := netip.ParseAddr(tlsConfig.ServerName); err == nil {
+		// RFC 6066 forbids literal IP addresses in SNI. Leave ServerName
+		// empty only when verification is disabled, matching URI semantics.
+		if tlsConfig.InsecureSkipVerify {
+			tlsConfig.ServerName = ""
+		}
 	}
 
 	path := strings.TrimSpace(os.Getenv("TLS_KEY_LOG"))
@@ -100,4 +118,15 @@ func main() {
 		}
 		go handleTcpConnection(ctx, c, client)
 	}
+}
+
+func withDefaultPort(address string, defaultPort string) string {
+	if address == "" {
+		return address
+	}
+	if _, _, err := net.SplitHostPort(address); err == nil {
+		return address
+	}
+	address = strings.TrimPrefix(strings.TrimSuffix(address, "]"), "[")
+	return net.JoinHostPort(address, defaultPort)
 }

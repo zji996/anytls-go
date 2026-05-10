@@ -5,7 +5,6 @@ import (
 	"anytls/util"
 	"crypto/md5"
 	"encoding/binary"
-	"fmt"
 	"io"
 	"net"
 	"os"
@@ -142,6 +141,16 @@ func (s *Session) OpenStream() (*Stream, error) {
 
 	//logrus.Debugln("stream open", sid, s.streams)
 
+	s.streamLock.Lock()
+	select {
+	case <-s.die:
+		s.streamLock.Unlock()
+		return nil, io.ErrClosedPipe
+	default:
+		s.streams[sid] = stream
+	}
+	s.streamLock.Unlock()
+
 	if sid >= 2 && s.peerVersion >= 2 {
 		s.synDoneLock.Lock()
 		if s.synDone != nil {
@@ -154,18 +163,18 @@ func (s *Session) OpenStream() (*Stream, error) {
 	}
 
 	if _, err := s.writeControlFrame(newFrame(cmdSYN, sid)); err != nil {
+		s.streamLock.Lock()
+		delete(s.streams, sid)
+		s.streamLock.Unlock()
 		return nil, err
 	}
 
 	s.buffering = false // proxy Write it's SocksAddr to flush the buffer
 
-	s.streamLock.Lock()
-	defer s.streamLock.Unlock()
 	select {
 	case <-s.die:
 		return nil, io.ErrClosedPipe
 	default:
-		s.streams[sid] = stream
 		return stream, nil
 	}
 }
@@ -197,7 +206,9 @@ func (s *Session) recvLoop() error {
 						stream, ok := s.streams[sid]
 						s.streamLock.RUnlock()
 						if ok {
-							stream.pipeW.Write(buffer)
+							data := make([]byte, len(buffer))
+							copy(data, buffer)
+							stream.queueIncoming(data)
 						}
 						buf.Put(buffer)
 					} else {
@@ -243,7 +254,7 @@ func (s *Session) recvLoop() error {
 					stream, ok := s.streams[sid]
 					s.streamLock.RUnlock()
 					if ok {
-						stream.closeWithError(fmt.Errorf("remote: %s", string(buffer)))
+						stream.closeWithError(newRemoteError(string(buffer)))
 					}
 					buf.Put(buffer)
 				}
@@ -324,7 +335,7 @@ func (s *Session) recvLoop() error {
 						return err
 					}
 					if s.isClient && !clientDebugPaddingScheme {
-						if padding.UpdatePaddingScheme(rawScheme) {
+						if padding.UpdatePaddingFactory(s.padding, rawScheme) {
 							logrus.Infof("[Update padding succeed] %x\n", md5.Sum(rawScheme))
 						} else {
 							logrus.Warnf("[Update padding failed] %x\n", md5.Sum(rawScheme))
@@ -375,48 +386,59 @@ func (s *Session) streamClosed(sid uint32) error {
 }
 
 func (s *Session) writeDataFrame(sid uint32, data []byte) (int, error) {
-	dataLen := len(data)
-
-	buffer := buf.NewSize(dataLen + headerOverHeadSize)
-	buffer.WriteByte(cmdPSH)
-	binary.BigEndian.PutUint32(buffer.Extend(4), sid)
-	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(dataLen))
-	buffer.Write(data)
-	_, err := s.writeConn(buffer.Bytes())
-	buffer.Release()
-	if err != nil {
-		return 0, err
+	written := 0
+	for len(data) > 0 {
+		dataLen := min(len(data), maxFrameDataLen)
+		if err := s.writePayloadFrame(sid, data[:dataLen]); err != nil {
+			return written, err
+		}
+		written += dataLen
+		data = data[dataLen:]
 	}
 
-	return dataLen, nil
+	return written, nil
+}
+
+func (s *Session) writePayloadFrame(sid uint32, data []byte) error {
+	buffer, err := encodeFrameRaw(cmdPSH, sid, data)
+	if err != nil {
+		return err
+	}
+	_, err = s.writeConn(buffer.Bytes())
+	buffer.Release()
+	return err
 }
 
 func (s *Session) writeControlFrame(frame frame) (int, error) {
 	dataLen := len(frame.data)
+	buffer, err := encodeFrame(frame)
+	if err != nil {
+		return 0, err
+	}
 
-	buffer := buf.NewSize(dataLen + headerOverHeadSize)
-	buffer.WriteByte(frame.cmd)
-	binary.BigEndian.PutUint32(buffer.Extend(4), frame.sid)
-	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(dataLen))
-	buffer.Write(frame.data)
-
-	s.conn.SetWriteDeadline(time.Now().Add(time.Second * 5))
-
-	_, err := s.writeConn(buffer.Bytes())
+	_, err = s.writeConnWithDeadline(buffer.Bytes(), time.Now().Add(time.Second*5))
 	buffer.Release()
 	if err != nil {
 		s.Close()
 		return 0, err
 	}
 
-	s.conn.SetWriteDeadline(time.Time{})
-
 	return dataLen, nil
 }
 
 func (s *Session) writeConn(b []byte) (n int, err error) {
+	return s.writeConnWithDeadline(b, time.Time{})
+}
+
+func (s *Session) writeConnWithDeadline(b []byte, deadline time.Time) (n int, err error) {
 	s.connLock.Lock()
 	defer s.connLock.Unlock()
+	if !deadline.IsZero() {
+		if err = s.conn.SetWriteDeadline(deadline); err != nil {
+			return 0, err
+		}
+		defer s.conn.SetWriteDeadline(time.Time{})
+	}
 
 	if s.buffering {
 		s.buffer = slices.Concat(s.buffer, b)

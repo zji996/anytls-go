@@ -142,7 +142,7 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 		return nil, err
 	}
 
-	session := NewClientSession(underlying, &padding.DefaultPaddingFactory)
+	session := NewClientSession(underlying, c.padding)
 	session.seq = c.sessionCounter.Add(1)
 	session.dieHook = func() {
 		if clientDebugSessionPool {

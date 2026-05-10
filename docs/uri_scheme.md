@@ -24,17 +24,22 @@ anytls://[auth@]hostname[:port]/?[key=value]&[key=value]...
 
 服务器的地址和可选端口。如果省略端口，则默认为 443。
 
+IPv6 地址遵循标准 URI 写法，带端口时必须使用方括号，例如 `[2409:8a71:6a00:1953::615]:8964`。
+
 ### 参数
 
 - `sni`：用于 TLS 连接的服务器 SNI。（特殊情况：当 `sni` 的值为 [IP 地址](https://datatracker.ietf.org/doc/html/rfc6066#section-3:~:text=Literal%20IPv4%20and%20IPv6%20addresses%20are%20not%20permitted%20in%20%22HostName%22.)时，客户端必须不发送 SNI）
 
-- `insecure`：是否允许不安全的 TLS 连接。接受 `1` 表示 `true`，`0` 表示 `false`。
+- `insecure`：是否允许不安全的 TLS 连接。接受 `1`/`true` 表示 `true`，`0`/`false` 表示 `false`。
+
+示例客户端为了保持旧版本的易用行为，命令行默认等价于 `-insecure=true`。URI 中显式设置 `insecure=0` 或命令行设置 `-insecure=false` 时，客户端会启用 TLS 证书校验。
 
 ## 示例
 
 ```
 anytls://letmein@example.com/?sni=real.example.com
 anytls://letmein@example.com/?sni=127.0.0.1&insecure=1
+anytls://letmein@example.com:8443/?sni=real.example.com&insecure=0
 anytls://0fdf77d7-d4ba-455e-9ed9-a98dd6d5489a@[2409:8a71:6a00:1953::615]:8964/?insecure=1
 ```
 

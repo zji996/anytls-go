@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const streamReceiveQueueSize = 16
+
 // Stream implements net.Conn
 type Stream struct {
 	id uint32
@@ -17,6 +19,9 @@ type Stream struct {
 
 	pipeR         *pipe.PipeReader
 	pipeW         *pipe.PipeWriter
+	recvCh        chan []byte
+	recvDone      chan struct{}
+	recvCloseOnce sync.Once
 	writeDeadline pipe.PipeDeadline
 
 	dieOnce sync.Once
@@ -32,7 +37,10 @@ func newStream(id uint32, sess *Session) *Stream {
 	s.id = id
 	s.sess = sess
 	s.pipeR, s.pipeW = pipe.Pipe()
+	s.recvCh = make(chan []byte, streamReceiveQueueSize)
+	s.recvDone = make(chan struct{})
 	s.writeDeadline = pipe.MakePipeDeadline()
+	go s.recvLoop()
 	return s
 }
 
@@ -69,6 +77,7 @@ func (s *Stream) closeLocally() {
 	var once bool
 	s.dieOnce.Do(func() {
 		s.dieErr = net.ErrClosed
+		s.closeReceiveQueue()
 		s.pipeR.Close()
 		once = true
 	})
@@ -84,6 +93,7 @@ func (s *Stream) closeWithError(err error) error {
 	var once bool
 	s.dieOnce.Do(func() {
 		s.dieErr = err
+		s.closeReceiveQueue()
 		s.pipeR.Close()
 		once = true
 	})
@@ -98,6 +108,39 @@ func (s *Stream) closeWithError(err error) error {
 	}
 }
 
+func (s *Stream) queueIncoming(data []byte) bool {
+	select {
+	case s.recvCh <- data:
+		return true
+	case <-s.recvDone:
+		return false
+	case <-s.sess.die:
+		return false
+	}
+}
+
+func (s *Stream) recvLoop() {
+	defer s.pipeW.Close()
+	for {
+		select {
+		case data := <-s.recvCh:
+			if len(data) > 0 {
+				_, _ = s.pipeW.Write(data)
+			}
+		case <-s.recvDone:
+			return
+		case <-s.sess.die:
+			return
+		}
+	}
+}
+
+func (s *Stream) closeReceiveQueue() {
+	s.recvCloseOnce.Do(func() {
+		close(s.recvDone)
+	})
+}
+
 func (s *Stream) SetReadDeadline(t time.Time) error {
 	return s.pipeR.SetReadDeadline(t)
 }
@@ -108,7 +151,9 @@ func (s *Stream) SetWriteDeadline(t time.Time) error {
 }
 
 func (s *Stream) SetDeadline(t time.Time) error {
-	s.SetWriteDeadline(t)
+	if err := s.SetWriteDeadline(t); err != nil {
+		return err
+	}
 	return s.SetReadDeadline(t)
 }
 

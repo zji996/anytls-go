@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"flag"
-	"io"
 	"net"
 	"os"
 	"time"
@@ -27,19 +26,14 @@ func main() {
 		logrus.Fatalln("please set password")
 	}
 	if *paddingScheme != "" {
-		if f, err := os.Open(*paddingScheme); err == nil {
-			b, err := io.ReadAll(f)
-			if err != nil {
-				logrus.Fatalln(err)
-			}
-			if padding.UpdatePaddingScheme(b) {
-				logrus.Infoln("loaded padding scheme file:", *paddingScheme)
-			} else {
-				logrus.Errorln("wrong format padding scheme file:", *paddingScheme)
-			}
-			f.Close()
-		} else {
+		b, err := os.ReadFile(*paddingScheme)
+		if err != nil {
 			logrus.Fatalln(err)
+		}
+		if padding.UpdatePaddingScheme(b) {
+			logrus.Infoln("loaded padding scheme file:", *paddingScheme)
+		} else {
+			logrus.Errorln("wrong format padding scheme file:", *paddingScheme)
 		}
 	}
 

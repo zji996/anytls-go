@@ -1,0 +1,185 @@
+# 海外服务器部署
+
+本文面向把当前 `anytls-go` 分支直接部署到一台 Linux VPS 的场景。
+
+## 推荐一键安装
+
+默认部署 `zji-dev` 分支，并在服务器现场构建：
+
+```
+curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bootstrap-anytls-server.sh | sudo bash
+```
+
+这个 bootstrap 脚本会：
+
+- 安装基础依赖：`ca-certificates`、`curl`、`git`、`tar`、`gzip`。
+- 如果服务器没有 Go，则安装脚本内指定的 Go 版本。
+- clone 或更新 `https://github.com/zji996/anytls-go.git` 的 `zji-dev` 分支到 `/opt/anytls-go`。
+- 执行 `go mod download`，提前下载 Go modules。
+- 启动菜单式服务端管理器，现场构建并安装 `anytls-server`。
+
+默认交互项尽量少：
+
+- 监听地址默认 `0.0.0.0:8443`。
+- 客户端 URI 的服务器地址默认自动探测公网 IP。
+- PaddingScheme 默认不自定义。
+- 安装完成后输出 AnyTLS URI，方便复制到支持 AnyTLS 的客户端。
+
+可通过环境变量覆盖默认值：
+
+```
+curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bootstrap-anytls-server.sh | sudo ANYTLS_BRANCH=zji-dev ANYTLS_SRC_DIR=/opt/anytls-go bash
+```
+
+## 服务器需要什么
+
+bootstrap 自动安装基础依赖后，服务器最终需要：
+
+- Linux amd64/arm64 服务器。
+- systemd，用于常驻运行 `anytls-server`。
+- Go 1.24 或更新版本，用于在服务器上从源码构建。bootstrap 会自动安装 Go；如果使用预编译二进制部署，则服务器不需要 Go。
+- 一个 TCP 端口，例如 `8443/tcp` 或 `443/tcp`。
+
+可选依赖：
+
+- `curl`：安装脚本用于自动探测公网 IP。
+- `python3`：安装脚本用于对 URI 密码做百分号编码；没有时也能继续输出未编码密码。
+- `ufw`、`firewalld` 或云厂商安全组：用于放行服务端口。
+
+当前示例服务端会自动生成临时自签 TLS 证书，适合快速部署和测试。生产部署如果需要严格 TLS 证书校验，应改造服务端 TLS 配置，加载正式证书。
+
+## 仓库内安装脚本
+
+在服务器上 clone 仓库后执行：
+
+```
+sudo ./scripts/install-anytls-server.sh
+```
+
+无参数运行时会进入交互式向导。也可以非交互执行：
+
+```
+sudo ./scripts/install-anytls-server.sh -p '你的密码' -l 0.0.0.0:8443 -s your.server.name --branch zji-dev --non-interactive
+```
+
+参数说明：
+
+- `-p` / `--password`：AnyTLS 密码，必填。
+- `-l` / `--listen`：监听地址，默认 `0.0.0.0:8443`。
+- `-s` / `--server-name`：生成客户端 URI 时使用的服务器域名或 IP。
+- `--branch`：源码构建时期望的 git 分支，默认 `zji-dev`。
+- `--binary`：使用已有 `anytls-server` 二进制安装，跳过服务器现场编译。
+- `--padding-scheme`：可选，安装自定义 PaddingScheme 文件。
+- `--non-interactive`：不提示输入，缺少必要参数时直接失败。
+
+脚本会安装：
+
+- `/usr/local/bin/anytls-server`
+- `/etc/anytls/server.env`
+- `/etc/systemd/system/anytls-server.service`
+
+常用管理命令：
+
+```
+sudo /opt/anytls-go/scripts/install-anytls-server.sh
+sudo systemctl status anytls-server
+sudo systemctl restart anytls-server
+sudo journalctl -u anytls-server -f
+```
+
+菜单功能：
+
+- 安装 / 重装服务端。
+- 更新 `zji-dev`、重新构建并重启。
+- 查看 systemd 状态和当前客户端 URI。
+- 重启服务。
+- 卸载服务和配置。
+
+安装后还需要在云厂商安全组或本机防火墙放行对应 TCP 端口。
+
+## 现场编译还是拷贝二进制
+
+当前仓库编译资源消耗较小，因此默认推荐服务器现场编译 `zji-dev`，这样部署路径最直接，也方便持续更新开发分支。若你需要完全固定已测试的二进制，仍可以本机或 CI 编译好再拷贝到服务器。
+
+本机实测当前分支构建资源，仅供估算：
+
+| 场景 | 耗时 | 峰值 RSS | 额外缓存/下载 |
+|--|--:|--:|--:|
+| 热构建 server | 约 7.8s | 约 34MB | 已有缓存 |
+| 热构建 client | 约 2.0s | 约 40MB | 已有缓存 |
+| 全冷构建 server | 约 11.3s | 约 37MB | module cache 约 15MB，build cache 约 89MB |
+
+产物大小：
+
+- `anytls-server` 约 5.4MB
+- `anytls-client` 约 6.3MB
+
+本机编译 server：
+
+```
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags='-s -w' -o anytls-server ./cmd/server
+```
+
+拷贝并安装：
+
+```
+scp anytls-server root@your.server:/tmp/anytls-server
+sudo ./scripts/install-anytls-server.sh -p '你的密码' -l 0.0.0.0:8443 -s your.server.name --binary /tmp/anytls-server
+```
+
+如果你的服务器也是 Linux amd64，直接使用上面的命令即可。arm64 服务器则把 `GOARCH=amd64` 改成 `GOARCH=arm64`。
+
+## 客户端连接
+
+示例客户端：
+
+```
+./anytls-client -l 127.0.0.1:1080 -s 'anytls://password@host:8443/?insecure=1'
+```
+
+如果使用当前示例服务端的自签证书，客户端需要 `insecure=1` 或命令行默认的不安全 TLS 模式。若后续服务端支持正式证书，可以使用 `insecure=0` 并设置正确的 `sni`。
+
+## 和 sing-box 的兼容性
+
+当前 `zji-dev` 分支保持 AnyTLS wire format 兼容：frame 格式、command 编号、PaddingScheme 语法和 v1/v2 协商均未改变。因此协议层目标是继续兼容实现了 AnyTLS 的客户端和服务端。
+
+sing-box 官方文档列出了 `anytls` inbound 和 outbound，并说明 AnyTLS outbound 自 sing-box 1.12.0 起可用。使用 sing-box 连接本服务端时，配置应使用 `type: "anytls"`、相同 `password`，并按服务端证书情况配置 TLS 的 `insecure` / `server_name`。
+
+示例 outbound：
+
+```json
+{
+  "type": "anytls",
+  "tag": "anytls-out",
+  "server": "your.server.name",
+  "server_port": 8443,
+  "password": "你的密码",
+  "idle_session_check_interval": "30s",
+  "idle_session_timeout": "30s",
+  "min_idle_session": 5,
+  "tls": {
+    "enabled": true,
+    "server_name": "your.server.name",
+    "insecure": true
+  }
+}
+```
+
+如果你的服务端使用示例自签证书，`insecure` 需要为 `true`。如果使用正式证书，应改为 `false`。
+
+## 和 Xray 的兼容性
+
+截至本文档编写时，Xray 官方协议列表未包含 AnyTLS。Xray 可以继续作为本机 SOCKS/HTTP 入站或其他链路的一部分，但不能直接把 AnyTLS 当作 Xray 原生 inbound/outbound 使用。
+
+可行组合是：
+
+- `anytls-client` 在本机提供 SOCKS/HTTP 入站。
+- Xray 客户端使用 SOCKS/HTTP outbound 指向 `anytls-client`。
+- 或使用 sing-box 作为 AnyTLS 客户端/服务端组件。
+
+## 安全和特征建议
+
+- 密码使用随机长字符串。
+- 优先使用 443/tcp 或常见 HTTPS 端口，但要确认服务器上没有其他服务占用。
+- 默认 PaddingScheme 只是示例；如果担心固定特征，建议使用自定义 PaddingScheme，并保留兼容语法。
+- 当前 `zji-dev` 的优化没有改变协议线格式；接收队列、分片、padding 作用域等都是实现层优化。

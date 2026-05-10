@@ -12,9 +12,48 @@
 
 [URI 格式](./docs/uri_scheme.md)
 
+[本地测试](./docs/testing.md)
+
+[优化策略](./docs/optimization.md)
+
+[海外服务器部署](./docs/deployment.md)
+
 ## 快速食用方法
 
 为了方便，示例服务器和客户端默认采用不安全的配置，该配置假设您不会遭遇 TLS 中间人攻击（这种情况偶尔发生在网络接入层，在骨干网络上几乎不可能实现）；否则，您的通信内容可能会被中间人截获。
+
+### 海外服务器一键安装
+
+`zji-dev` 分支提供服务端管理脚本，默认会拉取并现场编译 `zji-dev`：
+
+```
+curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bootstrap-anytls-server.sh | sudo bash
+```
+
+脚本会打开菜单式向导。默认值尽量自动化：
+
+- 监听地址默认 `0.0.0.0:8443`，直接回车即可。
+- 客户端 URI 的服务器地址默认自动探测公网 IP。
+- 只需要输入密码；PaddingScheme 默认不自定义。
+
+脚本会自动完成：
+
+- 安装基础依赖和 Go。
+- clone / 更新 `https://github.com/zji996/anytls-go.git` 的 `zji-dev` 分支。
+- 执行 `go mod download` 预下载依赖。
+- 从 `zji-dev` 源码构建 `anytls-server`。
+- 写入 systemd service 并启动服务。
+- 输出可复制到 sing-box、Shadowrocket 等客户端的 AnyTLS URI。
+
+脚本也可用于后续管理：
+
+```
+sudo /opt/anytls-go/scripts/install-anytls-server.sh
+```
+
+菜单支持安装/重装、更新 `zji-dev` 并重启、查看状态和客户端 URI、重启、卸载。
+
+安装完成后，需要在云厂商安全组或服务器防火墙放行对应 TCP 端口。
 
 ### 示例服务器
 
@@ -37,6 +76,18 @@ v0.0.12 版本起，示例客户端可直接使用 URI 格式:
 ```
 ./anytls-client -l 127.0.0.1:1080 -s "anytls://password@host:port"
 ```
+
+如果 URI 省略端口，示例客户端会使用默认端口 443。示例客户端默认允许不安全 TLS 连接；需要启用证书校验时可以使用 `-insecure=false`，或在 URI 中写 `?insecure=0`。
+
+### zji-dev 兼容性优化
+
+`zji-dev` 分支保持协议 wire format 兼容，不修改 frame 格式、command 编号、PaddingScheme 语法和 v1/v2 协商规则。当前优化集中在实现层：
+
+- 大块 Stream 数据会按 65535 字节上限拆分为多个 `cmdPSH`，避免 frame 长度截断。
+- 客户端先注册本地 stream 再发送 `cmdSYN`，减少快速 `cmdSYNACK` 回包造成的竞态。
+- 服务器下发的 PaddingScheme 只更新当前 Client 实例，不影响进程内其他 Client。
+- URI 行为与文档对齐，支持省略端口默认 443 和 `insecure` 参数。
+- 增加了基础单元测试，覆盖分片、URI 默认端口和 Client 级 padding 更新。
 
 ### sing-box
 

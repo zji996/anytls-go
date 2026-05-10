@@ -2,6 +2,9 @@ package session
 
 import (
 	"encoding/binary"
+	"fmt"
+
+	"github.com/sagernet/sing/common/buf"
 )
 
 const ( // cmds
@@ -20,6 +23,7 @@ const ( // cmds
 )
 
 const (
+	maxFrameDataLen    = 1<<16 - 1
 	headerOverHeadSize = 1 + 4 + 2
 )
 
@@ -32,6 +36,28 @@ type frame struct {
 
 func newFrame(cmd byte, sid uint32) frame {
 	return frame{cmd: cmd, sid: sid}
+}
+
+func encodeFrame(f frame) (*buf.Buffer, error) {
+	return encodeFrameRaw(f.cmd, f.sid, f.data)
+}
+
+func encodeFrameRaw(cmd byte, sid uint32, data []byte) (*buf.Buffer, error) {
+	dataLen := len(data)
+	if dataLen > maxFrameDataLen {
+		return nil, fmt.Errorf("frame data too large: %d", dataLen)
+	}
+
+	buffer := buf.NewSize(dataLen + headerOverHeadSize)
+	buffer.WriteByte(cmd)
+	binary.BigEndian.PutUint32(buffer.Extend(4), sid)
+	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(dataLen))
+	buffer.Write(data)
+	return buffer, nil
+}
+
+func newRemoteError(message string) error {
+	return fmt.Errorf("remote: %s", message)
 }
 
 type rawHeader [headerOverHeadSize]byte
