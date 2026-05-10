@@ -56,6 +56,14 @@ curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bo
 - 执行部署自检，检查服务状态、监听端口和 fallback 目标。
 - 输出可复制到 sing-box、Shadowrocket 等客户端的 AnyTLS URI。
 
+如果要和同服务器上的 Xray/VLESS Vision 节点做速度对比，可在客户端侧使用：
+
+```
+scripts/compare-proxies.sh --runs 10
+```
+
+默认对比 `socks5h://127.0.0.1:1080` 的 AnyTLS 和 `socks5h://127.0.0.1:1081` 的 Vision，输出平均 TTFB、下载 Mbps 和百分比差异。具体准备方式见 [本地测试](./docs/testing.md#anytls-vs-vision-实测对比)。
+
 脚本也可用于后续管理：
 
 ```

@@ -55,6 +55,7 @@ sudo /opt/anytls-go/scripts/install-anytls-server.sh doctor
 - 服务端支持认证失败 fallback。
 - 服务端支持明文 TCP 探测 fallback，首包会转发到 fallback 后端。
 - 部署脚本支持 TUI 菜单、随机密码、状态查看、更新、卸载和 `doctor` 自检。
+- 提供客户端侧 AnyTLS/Vision 对比脚本，方便在同一台 VPS 上实测首包和吞吐差异。
 
 ## 已验证项目
 
@@ -68,6 +69,8 @@ go vet ./...
 go test -race ./cmd/server ./proxy/session ./proxy/pipe ./proxy/padding
 go test -run '^TestPlainTCPProbeFallsBack$' ./cmd/server -count=1 -v
 go test -run '^$' -bench . -benchmem -count=3 ./proxy/session
+bash -n scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh scripts/compare-proxies.sh
+shellcheck scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh scripts/compare-proxies.sh
 ```
 
 本机 benchmark 当前可作为实现层回归基线：
@@ -80,6 +83,8 @@ go test -run '^$' -bench . -benchmem -count=3 ./proxy/session
 | 持久 net.Pipe 写帧 | 本轮约 4.4-4.6 us/op，64 B/op，1 alloc/op |
 
 benchmark 不经过真实 TLS、公网链路或目标 VPS，只用于观察本地实现开销。
+
+AnyTLS 与 Vision 的真实速度差异需要从客户端侧连接同一台 VPS 实测。当前仓库提供 `scripts/compare-proxies.sh`，默认对比 `socks5h://127.0.0.1:1080` 和 `socks5h://127.0.0.1:1081`，输出平均 TTFB、总耗时、下载 Mbps 和百分比差异。详见 [本地测试](./testing.md)。
 
 ## 当前限制
 

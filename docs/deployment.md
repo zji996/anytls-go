@@ -200,6 +200,33 @@ sing-box 官方文档列出了 `anytls` inbound 和 outbound，并说明 AnyTLS 
 - Xray 客户端使用 SOCKS/HTTP outbound 指向 `anytls-client`。
 - 或使用 sing-box 作为 AnyTLS 客户端/服务端组件。
 
+## 和 Vision 节点做速度对比
+
+AnyTLS 的速度优势主要来自 session 复用，理论上对短连接、频繁建连、首包延迟更敏感的场景更有利。Vision 的优势和瓶颈则取决于 Xray 配置、TLS/REALITY 设置、客户端实现和线路质量。要判断你自己的服务器上谁更快，应在客户端侧对同一台 VPS 做实测。
+
+准备方式：
+
+- 同一台 VPS 上同时部署 AnyTLS 服务端和 Vision 节点。
+- 客户端机器上分别启动两个本地代理入口，例如 AnyTLS `127.0.0.1:1080`，Vision `127.0.0.1:1081`。
+- 两个节点尽量使用同一 VPS、同一网络出口、相同测试 URL，避免把线路波动误判为协议差异。
+
+运行仓库内脚本：
+
+```
+scripts/compare-proxies.sh --runs 10
+```
+
+指定不同本地入口：
+
+```
+scripts/compare-proxies.sh \
+  --anytls socks5h://127.0.0.1:1080 \
+  --vision socks5h://127.0.0.1:1081 \
+  --runs 10
+```
+
+脚本会输出平均 TTFB、总耗时、下载 Mbps 和 AnyTLS 相对 Vision 的百分比差异，并保存 TSV 原始结果。这个结果是实际线路数据，比本机 benchmark 更能回答“快多少”；但它只代表当前客户端、VPS 和目标站点组合。
+
 ## 安全和特征建议
 
 - 密码使用随机长字符串。
