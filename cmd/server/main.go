@@ -20,6 +20,7 @@ func main() {
 	listen := flag.String("l", "0.0.0.0:8443", "server listen port")
 	password := flag.String("p", "", "password")
 	paddingScheme := flag.String("padding-scheme", "", "padding-scheme")
+	fallbackAddr := flag.String("fallback", "127.0.0.1:80", "fallback address for invalid connections")
 	flag.Parse()
 
 	if *password == "" {
@@ -48,6 +49,9 @@ func main() {
 
 	logrus.Infoln("[Server]", util.ProgramVersionName)
 	logrus.Infoln("[Server] Listening TCP", *listen)
+	if *fallbackAddr != "" {
+		logrus.Infoln("[Server] Fallback", *fallbackAddr)
+	}
 
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
@@ -62,7 +66,7 @@ func main() {
 	}
 
 	ctx := context.Background()
-	server := NewMyServer(tlsConfig)
+	server := NewMyServer(tlsConfig, *fallbackAddr)
 
 	for {
 		c, err := listener.Accept()

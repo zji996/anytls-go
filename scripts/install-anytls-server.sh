@@ -26,6 +26,7 @@ Options for install/update:
   -p, --password PASSWORD        AnyTLS password.
   -l, --listen ADDR             Listen address. Default: 0.0.0.0:8443
   -s, --server-name HOST        Host/IP used in generated client URI. Default: public IP.
+      --fallback ADDR           Fallback address for invalid connections. Default: 127.0.0.1:80
       --branch BRANCH           Expected source branch. Default: zji-dev
       --binary FILE             Existing anytls-server binary to install instead of building.
       --padding-scheme FILE     Optional PaddingScheme file.
@@ -38,6 +39,7 @@ action="menu"
 listen_addr="0.0.0.0:8443"
 password=""
 server_name=""
+fallback_addr="127.0.0.1:80"
 padding_scheme=""
 binary_path=""
 expected_branch="$default_branch"
@@ -68,6 +70,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --padding-scheme)
       padding_scheme="${2:-}"
+      shift 2
+      ;;
+    --fallback)
+      fallback_addr="${2:-}"
       shift 2
       ;;
     --binary)
@@ -190,16 +196,20 @@ prompt_yes_no() {
 }
 
 load_existing_defaults() {
-  local existing_listen existing_password existing_host
+  local existing_listen existing_password existing_host existing_fallback
   existing_listen="$(read_env_value ANYTLS_LISTEN || true)"
   existing_password="$(read_env_value ANYTLS_PASSWORD || true)"
   existing_host="$(read_env_value ANYTLS_SERVER_NAME || true)"
+  existing_fallback="$(read_env_value ANYTLS_FALLBACK || true)"
   listen_addr="${listen_addr:-${existing_listen:-0.0.0.0:8443}}"
   if [[ -z "$password" ]]; then
     password="$existing_password"
   fi
   if [[ -z "$server_name" ]]; then
     server_name="$existing_host"
+  fi
+  if [[ -n "$existing_fallback" && "$fallback_addr" == "127.0.0.1:80" ]]; then
+    fallback_addr="$existing_fallback"
   fi
 }
 
@@ -227,6 +237,7 @@ collect_install_inputs() {
     server_name="$(detect_public_ip)"
   fi
   server_name="$(prompt_default "Server IP/domain for client URI" "${server_name:-YOUR_SERVER_IP}")"
+  fallback_addr="$(prompt_default "Fallback address for invalid connections" "${fallback_addr:-127.0.0.1:80}")"
 
   if [[ -z "$padding_scheme" ]] && prompt_yes_no "Use custom PaddingScheme file?" "n"; then
     padding_scheme="$(prompt_default "PaddingScheme file path" "")"
@@ -282,6 +293,7 @@ write_service_files() {
 ANYTLS_LISTEN=$(env_quote "$listen_addr")
 ANYTLS_PASSWORD=$(env_quote "$password")
 ANYTLS_SERVER_NAME=$(env_quote "$server_name")
+ANYTLS_FALLBACK=$(env_quote "$fallback_addr")
 ANYTLS_PADDING_SCHEME=$(env_quote "$padding_scheme_target")
 LOG_LEVEL=info
 EOF
@@ -296,7 +308,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/anytls/server.env
-ExecStart=/bin/sh -c 'set -- -l "$ANYTLS_LISTEN" -p "$ANYTLS_PASSWORD"; if [ -n "$ANYTLS_PADDING_SCHEME" ]; then set -- "$@" -padding-scheme "$ANYTLS_PADDING_SCHEME"; fi; exec /usr/local/bin/anytls-server "$@"'
+ExecStart=/bin/sh -c 'set -- -l "$ANYTLS_LISTEN" -p "$ANYTLS_PASSWORD" -fallback "$ANYTLS_FALLBACK"; if [ -n "$ANYTLS_PADDING_SCHEME" ]; then set -- "$@" -padding-scheme "$ANYTLS_PADDING_SCHEME"; fi; exec /usr/local/bin/anytls-server "$@"'
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
@@ -392,6 +404,7 @@ show_status() {
     echo "Config:"
     echo "  listen: ${listen_addr:-$(read_env_value ANYTLS_LISTEN || true)}"
     echo "  server: ${server_name:-$(read_env_value ANYTLS_SERVER_NAME || true)}"
+    echo "  fallback: ${fallback_addr:-$(read_env_value ANYTLS_FALLBACK || true)}"
     echo "  env:    $env_file"
     echo
     echo "Client URI:"

@@ -7,9 +7,11 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"io"
 	"net"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/bufio"
@@ -40,13 +42,13 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 	by, err := b.ReadBytes(32)
 	if err != nil || !bytes.Equal(by, passwordSha256) {
 		b.Resize(0, n)
-		fallback(ctx, c)
+		fallback(ctx, c, s.fallbackAddr)
 		return
 	}
 	by, err = b.ReadBytes(2)
 	if err != nil {
 		b.Resize(0, n)
-		fallback(ctx, c)
+		fallback(ctx, c, s.fallbackAddr)
 		return
 	}
 	paddingLen := binary.BigEndian.Uint16(by)
@@ -54,7 +56,7 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 		_, err = b.ReadBytes(int(paddingLen))
 		if err != nil {
 			b.Resize(0, n)
-			fallback(ctx, c)
+			fallback(ctx, c, s.fallbackAddr)
 			return
 		}
 	}
@@ -83,7 +85,39 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 	session.Close()
 }
 
-func fallback(ctx context.Context, c net.Conn) {
-	// 暂未实现
-	logrus.Debugln("fallback:", c.RemoteAddr())
+func fallback(ctx context.Context, c net.Conn, fallbackAddr string) {
+	if fallbackAddr == "" {
+		logrus.Debugln("fallback disabled:", c.RemoteAddr())
+		return
+	}
+	logrus.Debugln("fallback:", c.RemoteAddr(), "=>", fallbackAddr)
+
+	dialer := net.Dialer{Timeout: time.Second * 5}
+	fallbackConn, err := dialer.DialContext(ctx, "tcp", fallbackAddr)
+	if err != nil {
+		logrus.Debugln("fallback dial:", err)
+		return
+	}
+	defer fallbackConn.Close()
+
+	errCh := make(chan error, 2)
+	go func() {
+		_, err := io.Copy(fallbackConn, c)
+		if tcpConn, ok := fallbackConn.(*net.TCPConn); ok {
+			_ = tcpConn.CloseWrite()
+		}
+		errCh <- err
+	}()
+	go func() {
+		_, err := io.Copy(c, fallbackConn)
+		if tcpConn, ok := c.(*net.TCPConn); ok {
+			_ = tcpConn.CloseWrite()
+		}
+		errCh <- err
+	}()
+
+	select {
+	case <-ctx.Done():
+	case <-errCh:
+	}
 }

@@ -22,6 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bo
 
 - 监听地址默认 `0.0.0.0:8443`。
 - 客户端 URI 的服务器地址默认自动探测公网 IP。
+- 认证失败 fallback 默认反代到 `127.0.0.1:80`。
 - PaddingScheme 默认不自定义。
 - 安装完成后输出 AnyTLS URI，方便复制到支持 AnyTLS 的客户端。
 
@@ -68,6 +69,7 @@ sudo ./scripts/install-anytls-server.sh -p '你的密码' -l 0.0.0.0:8443 -s you
 - `-l` / `--listen`：监听地址，默认 `0.0.0.0:8443`。
 - `-s` / `--server-name`：生成客户端 URI 时使用的服务器域名或 IP。
 - `--branch`：源码构建时期望的 git 分支，默认 `zji-dev`。
+- `--fallback`：认证失败时反代的地址，默认 `127.0.0.1:80`。
 - `--binary`：使用已有 `anytls-server` 二进制安装，跳过服务器现场编译。
 - `--padding-scheme`：可选，安装自定义 PaddingScheme 文件。
 - `--non-interactive`：不提示输入，缺少必要参数时直接失败。
@@ -182,4 +184,5 @@ sing-box 官方文档列出了 `anytls` inbound 和 outbound，并说明 AnyTLS 
 - 密码使用随机长字符串。
 - 优先使用 443/tcp 或常见 HTTPS 端口，但要确认服务器上没有其他服务占用。
 - 默认 PaddingScheme 只是示例；如果担心固定特征，建议使用自定义 PaddingScheme，并保留兼容语法。
+- fallback 默认转发到 `127.0.0.1:80`。如果要让主动探测看到正常网站，请在本机 80 端口运行 nginx/Caddy/静态站点；如果不需要 fallback，可在安装时把 fallback 设置为空。
 - 当前 `zji-dev` 的优化没有改变协议线格式；接收队列、分片、padding 作用域等都是实现层优化。
