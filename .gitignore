@@ -1,6 +1,36 @@
 /dist
 /cmd/client/client
 /cmd/server/server
+
+# Local build outputs
+/anytls-client
+/anytls-server
+/client
+/server
+*.test
 *.exe
 *.zip
+
+# Local test and benchmark artifacts
+/proxy-compare-*.tsv
+/anytls-vs-vision*.tsv
+*.bench
+*.bench.txt
+*.prof
+*.pprof
+*.coverprofile
+coverage.out
+cpu.out
+mem.out
+trace.out
+
+# Large temporary downloads used by proxy speed tests
+/download
+/download.*
+/speedtest
+/speedtest.*
+*.part
+
+# Local logs and editor state
+*.log
 .vscode
