@@ -25,9 +25,18 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 			logrus.Errorln("[BUG]", r, string(debug.Stack()))
 		}
 	}()
+	defer func() {
+		if c != nil {
+			_ = c.Close()
+		}
+	}()
 
+	var ok bool
+	c, ok = routeInitialConnection(ctx, c, s.fallbackAddr)
+	if !ok {
+		return
+	}
 	c = tls.Server(c, s.tlsConfig)
-	defer c.Close()
 
 	b := buf.NewPacket()
 	defer b.Release()
@@ -83,6 +92,25 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 	}, &padding.DefaultPaddingFactory)
 	session.Run()
 	session.Close()
+}
+
+func routeInitialConnection(ctx context.Context, c net.Conn, fallbackAddr string) (net.Conn, bool) {
+	var firstByte [1]byte
+	n, err := c.Read(firstByte[:])
+	if err != nil {
+		logrus.Debugln("initial read:", err)
+		return nil, false
+	}
+	if n == 0 {
+		return nil, false
+	}
+
+	cachedConn := bufio.NewCachedConn(c, buf.As(firstByte[:n]))
+	if firstByte[0] != 0x16 {
+		fallback(ctx, cachedConn, fallbackAddr)
+		return cachedConn, false
+	}
+	return cachedConn, true
 }
 
 func fallback(ctx context.Context, c net.Conn, fallbackAddr string) {

@@ -2,6 +2,8 @@
 
 本仓库的测试尽量设计成本机可运行，不依赖外部服务器、真实 TLS 证书或公网连通性。
 
+当前分支最近一次完整验证项见 [zji-dev 当前状态](./status.md)。
+
 ## 基础检查
 
 ```
@@ -22,6 +24,21 @@ go test ./proxy/session -count=1 -v
 
 ```
 go test -race ./proxy/session ./proxy/pipe ./proxy/padding
+```
+
+## 部署脚本检查
+
+脚本静态检查和语法检查：
+
+```
+bash -n scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh
+shellcheck scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh
+```
+
+服务端 fallback 本地测试在 `cmd/server` 中覆盖：明文 TCP 探测应被转发到 fallback，并且首包数据不会丢失。
+
+```
+go test ./cmd/server -count=1 -v
 ```
 
 ## 性能基线

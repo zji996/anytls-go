@@ -18,6 +18,8 @@
 
 [海外服务器部署](./docs/deployment.md)
 
+[zji-dev 当前状态](./docs/status.md)
+
 ## 快速食用方法
 
 为了方便，示例服务器和客户端默认采用不安全的配置，该配置假设您不会遭遇 TLS 中间人攻击（这种情况偶尔发生在网络接入层，在骨干网络上几乎不可能实现）；否则，您的通信内容可能会被中间人截获。
@@ -30,11 +32,19 @@
 curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bootstrap-anytls-server.sh | sudo bash
 ```
 
+也可以完全非交互安装，密码会自动生成并在安装完成后输出客户端 URI：
+
+```
+curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bootstrap-anytls-server.sh | sudo bash -s -- install --non-interactive
+```
+
 脚本会打开菜单式向导。默认值尽量自动化：
 
 - 监听地址默认 `0.0.0.0:8443`，直接回车即可。
 - 客户端 URI 的服务器地址默认自动探测公网 IP。
-- 只需要输入密码；PaddingScheme 默认不自定义。
+- 密码默认自动生成强随机值，直接回车即可。
+- fallback 默认指向 `127.0.0.1:80`，认证失败或明文探测会转发到本机 HTTP 服务。
+- PaddingScheme 默认不自定义。
 
 脚本会自动完成：
 
@@ -43,6 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bo
 - 执行 `go mod download` 预下载依赖。
 - 从 `zji-dev` 源码构建 `anytls-server`。
 - 写入 systemd service 并启动服务。
+- 执行部署自检，检查服务状态、监听端口和 fallback 目标。
 - 输出可复制到 sing-box、Shadowrocket 等客户端的 AnyTLS URI。
 
 脚本也可用于后续管理：
@@ -51,7 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bo
 sudo /opt/anytls-go/scripts/install-anytls-server.sh
 ```
 
-菜单支持安装/重装、更新 `zji-dev` 并重启、查看状态和客户端 URI、重启、卸载。
+菜单支持安装/重装、更新 `zji-dev` 并重启、查看状态和客户端 URI、自检、重启、卸载。
 
 安装完成后，需要在云厂商安全组或服务器防火墙放行对应 TCP 端口。
 
@@ -88,6 +99,8 @@ v0.0.12 版本起，示例客户端可直接使用 URI 格式:
 - 服务器下发的 PaddingScheme 只更新当前 Client 实例，不影响进程内其他 Client。
 - URI 行为与文档对齐，支持省略端口默认 443 和 `insecure` 参数。
 - 增加了基础单元测试，覆盖分片、URI 默认端口和 Client 级 padding 更新。
+
+当前状态详见 [zji-dev 当前状态](./docs/status.md)。简要来说，本分支已经支持 VPS 服务端一键部署、随机密码、fallback、自检和本机测试矩阵；仍默认使用自签 TLS 证书，生产环境如需严格证书校验应继续补正式证书加载能力。
 
 ### sing-box
 

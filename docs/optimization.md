@@ -43,11 +43,14 @@ go test -run '^$' -bench . -benchmem ./proxy/session
 
 - 大块 `Stream.Write` 按 frame 长度上限拆分，避免 `uint16` 截断。
 - 客户端先注册 stream 再发送 `cmdSYN`，降低快速 `cmdSYNACK` 竞态。
+- 控制帧写 deadline 收敛到连接写锁内，降低并发写竞争风险。
 - PaddingScheme 更新收敛到 Client 实例，不污染进程全局默认值。
 - PaddingScheme 在加载时预编译规则，运行时不再重复 split/parse。
 - frame 编码逻辑集中到 `frame.go`，减少数据帧和控制帧重复实现。
 - 接收侧增加每 stream 有界队列，避免单个慢 reader 直接阻塞 session 接收循环。
-- 本地 `net.Pipe` 测试覆盖 session 往返、padding 更新和握手失败传播。
+- 服务端支持认证失败 fallback 和明文 TCP 探测 fallback。
+- 部署脚本支持菜单、随机密码、更新、状态查看、卸载和 `doctor` 自检。
+- 本地 `net.Pipe` 测试覆盖 session 往返、padding 更新、握手失败传播和慢 reader 隔离。
 
 ## 当前性能数据
 
@@ -58,7 +61,9 @@ go test -run '^$' -bench . -benchmem ./proxy/session
 | 混合 PaddingSizes | 约 123 ns/op，55 B/op，2 allocs/op | 约 24 ns/op，4 B/op，0 allocs/op |
 | 固定 PaddingSizes | 未单独统计 | 约 7 ns/op，0 B/op，0 allocs/op |
 | 随机 PaddingSizes | 未单独统计 | 约 81 ns/op，16 B/op，1 alloc/op |
-| 持久 net.Pipe 写帧 | 约 4.4-4.7 us/op，64 B/op，1 alloc/op | 约 2.8-2.9 us/op，64 B/op，1 alloc/op |
+| 持久 net.Pipe 写帧 | 约 4.4-4.7 us/op，64 B/op，1 alloc/op | 本轮约 4.4-4.6 us/op，64 B/op，1 alloc/op |
+
+更完整的当前状态见 [zji-dev 当前状态](./status.md)。
 
 ## 后续可做但需要单独评估的优化
 

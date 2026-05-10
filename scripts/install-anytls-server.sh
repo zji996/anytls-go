@@ -18,6 +18,7 @@ Actions:
   install            Install or reinstall anytls-server.
   update             Update source tree, rebuild, and restart service.
   status             Show service status and current client URI.
+  doctor             Check local deployment prerequisites and service health.
   restart            Restart service.
   uninstall          Stop service and remove installed files.
   menu               Show interactive menu. Default when no action is given.
@@ -30,13 +31,13 @@ Options for install/update:
       --branch BRANCH           Expected source branch. Default: zji-dev
       --binary FILE             Existing anytls-server binary to install instead of building.
       --padding-scheme FILE     Optional PaddingScheme file.
-      --non-interactive         Do not prompt for missing values.
+      --non-interactive         Do not prompt; generate a password if missing.
   -h, --help                    Show this help.
 USAGE
 }
 
 action="menu"
-listen_addr="0.0.0.0:8443"
+listen_addr=""
 password=""
 server_name=""
 fallback_addr="127.0.0.1:80"
@@ -44,10 +45,11 @@ padding_scheme=""
 binary_path=""
 expected_branch="$default_branch"
 non_interactive=0
+fallback_arg_set=0
 
 if [[ $# -gt 0 ]]; then
   case "$1" in
-    install|update|status|restart|uninstall|menu)
+    install|update|status|doctor|restart|uninstall|menu)
       action="$1"
       shift
       ;;
@@ -74,6 +76,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --fallback)
       fallback_addr="${2:-}"
+      fallback_arg_set=1
       shift 2
       ;;
     --binary)
@@ -126,6 +129,11 @@ read_env_value() {
   if [[ -f "$env_file" ]]; then
     sed -n "s/^${key}=//p" "$env_file" | tail -n 1 | sed "s/^'//; s/'$//; s/'\\\\''/'/g"
   fi
+}
+
+env_key_exists() {
+  local key="$1"
+  [[ -f "$env_file" ]] && grep -q "^${key}=" "$env_file"
 }
 
 detect_public_ip() {
@@ -208,7 +216,7 @@ load_existing_defaults() {
   if [[ -z "$server_name" ]]; then
     server_name="$existing_host"
   fi
-  if [[ -n "$existing_fallback" && "$fallback_addr" == "127.0.0.1:80" ]]; then
+  if [[ "$fallback_arg_set" -eq 0 ]] && env_key_exists ANYTLS_FALLBACK; then
     fallback_addr="$existing_fallback"
   fi
 }
@@ -217,8 +225,7 @@ collect_install_inputs() {
   load_existing_defaults
   if [[ "$non_interactive" -eq 1 ]]; then
     if [[ -z "$password" ]]; then
-      echo "missing required --password" >&2
-      exit 2
+      password="$(generate_password)"
     fi
     if [[ -z "$server_name" ]]; then
       server_name="$(detect_public_ip)"
@@ -354,9 +361,107 @@ print_summary() {
   echo "service: sudo systemctl status $service_name"
   echo "logs:    sudo journalctl -u $service_name -f"
   echo "port:    ${listen_addr##*:}/tcp must be open in your cloud firewall/security group."
+  if [[ -n "$fallback_addr" ]]; then
+    echo "fallback: invalid AnyTLS traffic is forwarded to $fallback_addr."
+  fi
   echo
   echo "Client URI:"
   client_uri
+}
+
+check_command() {
+  local name="$1"
+  if command -v "$name" >/dev/null 2>&1; then
+    echo "  ok: $name"
+  else
+    echo "  warn: $name not found"
+  fi
+}
+
+check_listen_port() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ltn "( sport = :$port )" 2>/dev/null | awk 'NR > 1 { found=1 } END { exit found ? 0 : 1 }'; then
+      echo "  ok: tcp/$port is listening"
+    else
+      echo "  warn: tcp/$port is not listening locally"
+    fi
+  else
+    echo "  skip: ss not found, cannot check listening port"
+  fi
+}
+
+check_fallback() {
+  if [[ -z "$fallback_addr" ]]; then
+    echo "  ok: fallback disabled"
+    return
+  fi
+  local fallback_host fallback_port
+  fallback_port="${fallback_addr##*:}"
+  fallback_host="${fallback_addr%:*}"
+  if [[ "$fallback_addr" == *"]:"* ]]; then
+    fallback_port="${fallback_addr##*:}"
+    fallback_host="${fallback_addr%:*}"
+    fallback_host="${fallback_host#[}"
+    fallback_host="${fallback_host%]}"
+  fi
+  if command -v ss >/dev/null 2>&1 && [[ "$fallback_host" == "127.0.0.1" || "$fallback_host" == "localhost" || "$fallback_host" == "::1" ]]; then
+    if ss -ltn "( sport = :$fallback_port )" 2>/dev/null | awk 'NR > 1 { found=1 } END { exit found ? 0 : 1 }'; then
+      echo "  ok: fallback target $fallback_addr is listening"
+    else
+      echo "  warn: fallback target $fallback_addr is not listening; active probes may see a closed backend"
+    fi
+  else
+    echo "  info: fallback target $fallback_addr not checked locally"
+  fi
+}
+
+run_doctor() {
+  require_systemd
+  load_existing_defaults
+  local current_listen current_port
+  current_listen="${listen_addr:-$(read_env_value ANYTLS_LISTEN || true)}"
+  current_port="${current_listen##*:}"
+
+  echo "AnyTLS deployment doctor"
+  echo
+  echo "Commands:"
+  check_command systemctl
+  check_command git
+  check_command go
+  check_command curl
+  check_command ss
+  echo
+  echo "Service:"
+  if systemctl is-enabled "$service_name" >/dev/null 2>&1; then
+    echo "  ok: $service_name is enabled"
+  else
+    echo "  warn: $service_name is not enabled"
+  fi
+  if systemctl is-active "$service_name" >/dev/null 2>&1; then
+    echo "  ok: $service_name is active"
+  else
+    echo "  warn: $service_name is not active"
+  fi
+  if [[ -x "$bin_path" ]]; then
+    echo "  ok: binary exists at $bin_path"
+  else
+    echo "  warn: binary missing at $bin_path"
+  fi
+  if [[ -f "$env_file" ]]; then
+    echo "  ok: config exists at $env_file"
+  else
+    echo "  warn: config missing at $env_file"
+  fi
+  if [[ -n "$current_port" ]]; then
+    check_listen_port "$current_port"
+  fi
+  check_fallback
+  echo
+  echo "Client URI:"
+  client_uri
+  echo
+  echo "Reminder: also open tcp/${current_port:-8443} in your cloud security group or provider firewall."
 }
 
 install_or_update() {
@@ -370,6 +475,8 @@ install_or_update() {
   systemctl enable --now "$service_name"
   systemctl restart "$service_name"
   print_summary
+  echo
+  run_doctor
 }
 
 update_source_tree() {
@@ -446,8 +553,9 @@ show_menu() {
     echo "1) Install / Reinstall"
     echo "2) Update zji-dev and restart"
     echo "3) Status and client URI"
-    echo "4) Restart"
-    echo "5) Uninstall"
+    echo "4) Doctor / self-check"
+    echo "5) Restart"
+    echo "6) Uninstall"
     echo "0) Exit"
     read -r -p "Select [1]: " choice </dev/tty
     choice="${choice:-1}"
@@ -455,8 +563,9 @@ show_menu() {
       1) install_or_update ;;
       2) do_update ;;
       3) show_status ;;
-      4) do_restart ;;
-      5) do_uninstall ;;
+      4) run_doctor ;;
+      5) do_restart ;;
+      6) do_uninstall ;;
       0) exit 0 ;;
       *) echo "invalid choice" ;;
     esac
@@ -467,6 +576,7 @@ case "$action" in
   install) install_or_update ;;
   update) do_update ;;
   status) show_status ;;
+  doctor) run_doctor ;;
   restart) do_restart ;;
   uninstall) do_uninstall ;;
   menu) show_menu ;;

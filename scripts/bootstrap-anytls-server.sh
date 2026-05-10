@@ -10,6 +10,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   bootstrap-anytls-server.sh [--repo URL] [--branch zji-dev] [--dir /opt/anytls-go] [-- INSTALLER_ARGS...]
+  bootstrap-anytls-server.sh install --non-interactive
 
 Environment:
   ANYTLS_REPO_URL     Repository URL. Default: https://github.com/zji996/anytls-go.git
@@ -45,6 +46,10 @@ while [[ $# -gt 0 ]]; do
     -h|--help)
       usage
       exit 0
+      ;;
+    install|update|status|doctor|restart|uninstall|menu)
+      installer_args=("$@")
+      break
       ;;
     *)
       echo "unknown argument: $1" >&2
@@ -124,5 +129,5 @@ echo "pre-downloading Go modules..."
 )
 
 echo
-echo "starting interactive installer..."
-exec "$install_dir/scripts/install-anytls-server.sh" --branch "$branch" "${installer_args[@]}"
+echo "starting installer..."
+exec "$install_dir/scripts/install-anytls-server.sh" "${installer_args[@]}" --branch "$branch"
