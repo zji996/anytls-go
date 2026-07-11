@@ -29,8 +29,8 @@ curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bo
 
 这个 bootstrap 脚本会：
 
-- 安装基础依赖：`ca-certificates`、`curl`、`git`、`tar`、`gzip`。
-- 如果服务器没有 Go，则安装脚本内指定的 Go 版本。
+- 安装基础依赖：`ca-certificates`、`curl`、`git`、`tar`、`gzip`、`python3`。
+- 如果现有 Go 低于仓库 `go.mod` 要求，则安装脚本内指定的 Go 版本；下载文件会按 Go 官网 JSON 清单校验 SHA256。
 - clone 或更新 `https://github.com/zji996/anytls-go.git` 的 `zji-dev` 分支到 `/opt/anytls-go`。
 - 执行 `go mod download`，提前下载 Go modules。
 - 启动菜单式服务端管理器，现场构建并安装 `anytls-server`。
@@ -64,7 +64,6 @@ bootstrap 自动安装基础依赖后，服务器最终需要：
 可选依赖：
 
 - `curl`：安装脚本用于自动探测公网 IP。
-- `python3`：安装脚本用于对 URI 密码做百分号编码；没有时也能继续输出未编码密码。
 - `ufw`、`firewalld` 或云厂商安全组：用于放行服务端口。
 
 当前示例服务端会自动生成临时自签 TLS 证书，适合快速部署和测试。生产部署如果需要严格 TLS 证书校验，应改造服务端 TLS 配置，加载正式证书。
@@ -95,11 +94,18 @@ sudo ./scripts/install-anytls-server.sh -p '你的密码' -l 0.0.0.0:8443 -s you
 - `--no-firewall`：不自动修改本机防火墙规则。
 - `--non-interactive`：不提示输入；未传密码时自动生成随机密码。
 
+交互安装时可在 fallback 提示中输入 `none` 或 `off` 禁用；非交互安装使用 `--fallback ''`。
+
 脚本会安装：
 
 - `/usr/local/bin/anytls-server`
 - `/etc/anytls/server.env`
+- `/etc/anytls/server.password`
 - `/etc/systemd/system/anytls-server.service`
+
+服务默认使用专用的 `anytls` 系统用户运行。密码单独保存在 `server.password`，不会写入 systemd 的 `ExecStart` 参数或非敏感环境文件；配置目录仅允许 root 和 `anytls` 组读取。监听 443 等低端口时只授予 `CAP_NET_BIND_SERVICE`，不会以 root 身份运行服务。
+
+安装和重装使用临时构建与原子文件替换。新二进制会先通过服务端包测试，systemd 重启和监听检查失败时自动恢复原二进制、配置和 unit。`doctor` 对服务未启用、未运行、文件缺失或端口未监听返回非零退出码，适合用于自动化部署判断。
 
 常用管理命令：
 
@@ -120,13 +126,25 @@ sudo journalctl -u anytls-server -f
 - 重启服务。
 - 卸载服务和配置。
 
+更新操作先把远端提交放入临时 Git worktree，并用候选源码完成测试、构建和部署；只有候选服务通过检查后，主源码目录才会快进到新提交。存在已跟踪的本地修改、分支不一致或历史分叉时会拒绝自动更新。
+
 安装脚本会尽量自动放行本机防火墙：
 
 - `ufw` 已启用时执行 `ufw allow PORT/tcp`。
 - `firewalld` 已运行时执行永久端口规则并 reload。
 - 没有 `ufw` / `firewalld` 但存在 `iptables` 时，添加运行时 ACCEPT 规则；这类规则可能不会在重启后保留。
 
+脚本只记录和管理自己新增的防火墙规则。更换监听端口时会删除旧的受管规则，卸载时也会清理；安装前已经存在的规则不会被删除。使用 `--no-firewall` 时，已有受管规则保持不变。
+
 云厂商安全组或供应商防火墙无法从 VPS 内可靠修改，仍需要在控制台手动放行对应 TCP 端口。若不希望脚本修改本机防火墙，可加 `--no-firewall`。
+
+bootstrap 会拒绝覆盖已有的非 Git 目录，也会核对已有仓库的 `origin`、当前分支和工作区状态。通过 bootstrap 创建的源码目录会被标记为受管目录，执行卸载时一并删除；Go 工具链和系统软件包可能被其他程序共用，因此卸载不会删除它们。
+
+仓库内可用隔离测试验证安装、凭据文件、健康检查、失败回滚和卸载流程，不会操作真实 systemd 或防火墙：
+
+```
+./scripts/test-installation.sh
+```
 
 ## 现场编译还是拷贝二进制
 
