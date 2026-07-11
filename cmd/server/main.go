@@ -7,8 +7,10 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -16,25 +18,80 @@ import (
 
 var passwordSha256 []byte
 
-func main() {
-	listen := flag.String("l", "0.0.0.0:8443", "server listen port")
-	password := flag.String("p", "", "password")
-	paddingScheme := flag.String("padding-scheme", "", "padding-scheme")
-	fallbackAddr := flag.String("fallback", "127.0.0.1:80", "fallback address for invalid connections")
-	flag.Parse()
+type serverConfig struct {
+	listen        string
+	password      string
+	paddingScheme string
+	fallbackAddr  string
+}
 
-	if *password == "" {
-		logrus.Fatalln("please set password")
+func envOrDefault(key, fallback string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
 	}
-	if *paddingScheme != "" {
-		b, err := os.ReadFile(*paddingScheme)
+	return fallback
+}
+
+func loadPassword(password, passwordFile string) (string, error) {
+	if password != "" && passwordFile != "" {
+		return "", fmt.Errorf("set only one of password and password-file")
+	}
+	if passwordFile != "" {
+		contents, err := os.ReadFile(passwordFile)
+		if err != nil {
+			return "", fmt.Errorf("read password file: %w", err)
+		}
+		password = strings.TrimSuffix(string(contents), "\n")
+		password = strings.TrimSuffix(password, "\r")
+	}
+	if password == "" {
+		return "", fmt.Errorf("password is required")
+	}
+	if strings.ContainsAny(password, "\r\n") {
+		return "", fmt.Errorf("password must not contain newlines")
+	}
+	return password, nil
+}
+
+func parseServerConfig(args []string) (serverConfig, error) {
+	flags := flag.NewFlagSet("anytls-server", flag.ContinueOnError)
+	listen := flags.String("l", envOrDefault("ANYTLS_LISTEN", "0.0.0.0:8443"), "server listen port")
+	password := flags.String("p", "", "password (prefer -password-file for services)")
+	passwordFile := flags.String("password-file", os.Getenv("ANYTLS_PASSWORD_FILE"), "file containing the password")
+	paddingScheme := flags.String("padding-scheme", os.Getenv("ANYTLS_PADDING_SCHEME"), "padding-scheme")
+	fallbackAddr := flags.String("fallback", envOrDefault("ANYTLS_FALLBACK", "127.0.0.1:80"), "fallback address for invalid connections")
+	if err := flags.Parse(args); err != nil {
+		return serverConfig{}, err
+	}
+	if flags.NArg() != 0 {
+		return serverConfig{}, fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	resolvedPassword, err := loadPassword(*password, *passwordFile)
+	if err != nil {
+		return serverConfig{}, err
+	}
+	return serverConfig{
+		listen:        *listen,
+		password:      resolvedPassword,
+		paddingScheme: *paddingScheme,
+		fallbackAddr:  *fallbackAddr,
+	}, nil
+}
+
+func main() {
+	config, err := parseServerConfig(os.Args[1:])
+	if err != nil {
+		logrus.Fatalln(err)
+	}
+	if config.paddingScheme != "" {
+		b, err := os.ReadFile(config.paddingScheme)
 		if err != nil {
 			logrus.Fatalln(err)
 		}
 		if padding.UpdatePaddingScheme(b) {
-			logrus.Infoln("loaded padding scheme file:", *paddingScheme)
+			logrus.Infoln("loaded padding scheme file:", config.paddingScheme)
 		} else {
-			logrus.Errorln("wrong format padding scheme file:", *paddingScheme)
+			logrus.Errorln("wrong format padding scheme file:", config.paddingScheme)
 		}
 	}
 
@@ -44,16 +101,16 @@ func main() {
 	}
 	logrus.SetLevel(logLevel)
 
-	var sum = sha256.Sum256([]byte(*password))
+	var sum = sha256.Sum256([]byte(config.password))
 	passwordSha256 = sum[:]
 
 	logrus.Infoln("[Server]", util.ProgramVersionName)
-	logrus.Infoln("[Server] Listening TCP", *listen)
-	if *fallbackAddr != "" {
-		logrus.Infoln("[Server] Fallback", *fallbackAddr)
+	logrus.Infoln("[Server] Listening TCP", config.listen)
+	if config.fallbackAddr != "" {
+		logrus.Infoln("[Server] Fallback", config.fallbackAddr)
 	}
 
-	listener, err := net.Listen("tcp", *listen)
+	listener, err := net.Listen("tcp", config.listen)
 	if err != nil {
 		logrus.Fatalln("listen server tcp:", err)
 	}
@@ -67,7 +124,7 @@ func main() {
 	}
 
 	ctx := context.Background()
-	server := NewMyServer(tlsConfig, *fallbackAddr)
+	server := NewMyServer(tlsConfig, config.fallbackAddr)
 
 	for {
 		c, err := listener.Accept()
