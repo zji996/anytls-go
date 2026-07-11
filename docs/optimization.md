@@ -48,6 +48,20 @@ go test -run '^$' -bench . -benchmem ./proxy/session
 - PaddingScheme 在加载时预编译规则，运行时不再重复 split/parse。
 - frame 编码逻辑集中到 `frame.go`，减少数据帧和控制帧重复实现。
 - 接收侧增加每 stream 有界队列，避免单个慢 reader 直接阻塞 session 接收循环。
+- 接收队列溢出时只关闭对应 stream，不再让慢 reader 阻塞整个 session。
+- 数据帧写失败会立即关闭 session，避免复用已经产生半帧的连接。
+- Stream 写 deadline 可以中断正在等待或执行的底层写入。
+- frame command/length 和 PaddingScheme 范围增加严格校验。
+- 服务端初始探测、TLS 握手和认证阶段增加超时，认证支持分段读取。
+- Stream 关闭状态改为并发安全访问。
+- Session 接收 buffer 直接转移给 Stream，消费后归还池，移除每帧等长堆分配和一次完整拷贝。
+- Stream 直接消费有界队列，不再为每条 Stream 创建内部 pipe goroutine。
+- Stream 实现 sing `ReadBuffer` / `WriteBuffer` 和 frame headroom 接口，发送侧可以原地添加 frame header。
+- 普通 Stream 写帧改为直接使用字节池，稳定路径不再产生堆分配。
+- 空闲 Session 池从通用 SkipList 改为无节点分配的内部最大堆，并移除 `stl4go` 依赖。
+- 随机 padding 改为每 Session 一次系统熵播种 ChaCha8，并复用固定 scratch。
+- 客户端启用 TLS session cache，可选 `-prewarm` 预建空闲 Session。
+- 临时服务端证书改用 ECDSA P-256，减少完整 TLS 握手的签名成本和证书体积。
 - 服务端支持认证失败 fallback 和明文 TCP 探测 fallback。
 - 部署脚本支持菜单、随机密码、更新、状态查看、卸载和 `doctor` 自检。
 - 本地 `net.Pipe` 测试覆盖 session 往返、padding 更新、握手失败传播和慢 reader 隔离。
@@ -56,18 +70,22 @@ go test -run '^$' -bench . -benchmem ./proxy/session
 
 以下数据来自本机 `go test -run '^$' -bench ... -benchmem ./proxy/session`，仅用于实现层回归对比，不代表公网吞吐。
 
-| 项目 | 优化前 | 当前 |
+| 项目 | 本轮优化前 | 当前 |
 |--|--:|--:|
-| 混合 PaddingSizes | 约 123 ns/op，55 B/op，2 allocs/op | 约 24 ns/op，4 B/op，0 allocs/op |
-| 固定 PaddingSizes | 未单独统计 | 约 7 ns/op，0 B/op，0 allocs/op |
-| 随机 PaddingSizes | 未单独统计 | 约 81 ns/op，16 B/op，1 alloc/op |
-| 持久 net.Pipe 写帧 | 约 4.4-4.7 us/op，64 B/op，1 alloc/op | 本轮约 4.4-4.6 us/op，64 B/op，1 alloc/op |
+| Stream 16 KiB 写 | 约 1.99 us/op，64 B/op，1 alloc/op | 约 1.93 us/op，0 B/op，0 allocs/op |
+| Stream 16 KiB 队列读 | 约 0.76 us/op | 约 0.20 us/op，0 B/op，0 allocs/op |
+| Session 完整收帧 16 KiB | 约 7.77 us/op，16.5 KiB/op，1 alloc/op | 约 2.38 us/op，0 B/op，0 allocs/op |
+| Session RNG PaddingSizes | 约 262 ns/op，16 B/op，1 alloc/op | 约 10 ns/op，0 B/op，0 allocs/op |
+| 空闲 Session 池取还 | 约 88 ns/op，约 71 B/op，2 allocs/op | 约 58 ns/op，0 B/op，0 allocs/op |
+| 本地 TLS 完整/恢复握手 | 约 1.02 ms / 0.44 ms | 约 0.49 ms / 0.44 ms |
 
 更完整的当前状态见 [zji-dev 当前状态](./status.md)。
 
+同机、同口径的优化前后五轮数据见 [性能优化前后对比](./performance-comparison.md)。
+
 ## 后续可做但需要单独评估的优化
 
-- 接收队列策略调优：根据真实压力测试调整队列大小、内存占用和背压行为。
+- 接收队列策略调优：根据真实压力测试调整队列大小和溢出淘汰阈值。
 - 下行 padding：可用现有 `cmdWaste` 实现，但应默认关闭或只在 `stealth` profile 中开启。
 - padding profile：以配置方式切换速度/安全取舍，不改变协议格式。
-- 更细的 benchmark：拆分纯编码、net.Pipe、TLS、本地回环四类基线，避免把不同开销混在一起。
+- 本地 TCP + TLS 持续吞吐 benchmark：当前 net.Pipe 和 TLS 握手基准已覆盖，仍需补长期本地回环与真实 VPS 数据。

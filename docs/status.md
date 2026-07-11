@@ -52,6 +52,17 @@ sudo /opt/anytls-go/scripts/install-anytls-server.sh doctor
 - PaddingScheme 在加载时预编译规则，减少运行时 split/parse/分配。
 - frame 编码逻辑集中到 `proxy/session/frame.go`。
 - 每个 stream 增加有界接收队列，降低单个慢 reader 阻塞整个 session 的概率。
+- 接收队列溢出时淘汰单个 stream，避免反压扩散到同一 session 的其他 stream。
+- 数据 frame 写失败后立即关闭 session，避免损坏连接返回空闲池。
+- Stream 写 deadline 会中断阻塞写，Stream 终止状态支持并发访问。
+- 未知 command、非法 command data 和越界 PaddingScheme 会被拒绝。
+- 服务端初始连接阶段有统一超时，认证请求支持跨多次读取组装。
+- Session 接收数据直接使用池化 buffer，移除了每帧等长堆分配和额外复制。
+- Stream 不再创建内部 pipe goroutine，并实现 sing ExtendedBuffer/headroom 快速路径。
+- 普通 Stream 写和完整 Session 收帧稳定路径达到 0 B/op、0 allocs/op。
+- 空闲 Session 池改为内部最大堆，移除了 `stl4go` 依赖。
+- Padding 随机数使用 Session 级 ChaCha8，客户端支持 TLS session cache 和可选预热。
+- 临时 TLS 证书使用 ECDSA P-256。
 - 服务端支持认证失败 fallback。
 - 服务端支持明文 TCP 探测 fallback，首包会转发到 fallback 后端。
 - 部署脚本支持 TUI 菜单、随机密码、状态查看、更新、卸载和 `doctor` 自检。
@@ -67,7 +78,7 @@ bash -n scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh
 shellcheck scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh
 go test ./...
 go vet ./...
-go test -race ./cmd/server ./proxy/session ./proxy/pipe ./proxy/padding
+go test -race ./...
 go test -run '^TestPlainTCPProbeFallsBack$' ./cmd/server -count=1 -v
 go test -run '^$' -bench . -benchmem -count=3 ./proxy/session
 bash -n scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh scripts/compare-proxies.sh
@@ -78,10 +89,12 @@ shellcheck scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh s
 
 | 项目 | 当前范围 |
 |--|--:|
-| 固定 PaddingSizes | 约 6.9 ns/op，0 B/op，0 allocs/op |
-| 随机 PaddingSizes | 约 80-81 ns/op，16 B/op，1 alloc/op |
-| 混合 PaddingSizes | 热身后约 24 ns/op，4 B/op，0 allocs/op |
-| 持久 net.Pipe 写帧 | 本轮约 4.4-4.6 us/op，64 B/op，1 alloc/op |
+| Stream 16 KiB 写 | 约 1.94-2.02 us/op，0 B/op，0 allocs/op |
+| Stream 16 KiB 队列读 | 约 0.20 us/op，0 B/op，0 allocs/op |
+| Session 完整收帧 16 KiB | 约 2.39-2.41 us/op，0 B/op，0 allocs/op |
+| Session RNG PaddingSizes | 约 10 ns/op，0 B/op，0 allocs/op |
+| 空闲 Session 池取还 | 约 57 ns/op，0 B/op，0 allocs/op |
+| 本地 TLS 完整/恢复握手 | 约 487-540 us / 435-449 us |
 
 benchmark 不经过真实 TLS、公网链路或目标 VPS，只用于观察本地实现开销。
 

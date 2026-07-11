@@ -16,6 +16,8 @@
 
 [优化策略](./docs/optimization.md)
 
+[性能优化前后对比](./docs/performance-comparison.md)
+
 [海外服务器部署](./docs/deployment.md)
 
 [zji-dev 当前状态](./docs/status.md)
@@ -90,6 +92,14 @@ sudo /opt/anytls-go/scripts/install-anytls-server.sh
 ```
 
 `127.0.0.1:1080` 为本机 Socks5 代理监听地址，理论上支持 TCP 和 UDP(通过 udp over tcp 传输)。
+
+需要降低客户端启动后的首次请求延迟时，可以选择预建空闲 Session：
+
+```
+./anytls-client -l 127.0.0.1:1080 -s 服务器ip:端口 -p 密码 -prewarm 2
+```
+
+预热默认关闭，避免在不需要时额外建立连接。
 
 v0.0.12 版本起，示例客户端可直接使用 URI 格式:
 
