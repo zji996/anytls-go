@@ -26,6 +26,7 @@ func main() {
 	insecure := flag.Bool("insecure", true, "Allow insecure TLS connection")
 	password := flag.String("p", "", "Password")
 	minIdleSession := flag.Int("m", 5, "Reserved min idle session")
+	prewarm := flag.Int("prewarm", 0, "Pre-create idle sessions for lower first-request latency")
 	flag.Parse()
 
 	if serverURL, err := url.Parse(*serverAddr); err == nil {
@@ -81,6 +82,7 @@ func main() {
 	tlsConfig := &tls.Config{
 		ServerName:         *sni,
 		InsecureSkipVerify: *insecure,
+		ClientSessionCache: tls.NewLRUClientSessionCache(64),
 	}
 	if tlsConfig.ServerName == "" {
 		// disable the SNI
@@ -95,7 +97,7 @@ func main() {
 
 	path := strings.TrimSpace(os.Getenv("TLS_KEY_LOG"))
 	if path != "" {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 		if err == nil {
 			tlsConfig.KeyLogWriter = f
 		}
@@ -110,6 +112,13 @@ func main() {
 		conn = tls.Client(conn, tlsConfig)
 		return conn, nil
 	}, *minIdleSession)
+	if *prewarm > 0 {
+		go func() {
+			if err := client.Prewarm(ctx, *prewarm); err != nil {
+				logrus.Warnln("prewarm sessions:", err)
+			}
+		}()
+	}
 
 	for {
 		c, err := listener.Accept()

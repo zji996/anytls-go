@@ -3,8 +3,8 @@ package main
 import (
 	"anytls/proxy/padding"
 	"anytls/proxy/session"
-	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/binary"
 	"io"
@@ -19,6 +19,8 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+const initialConnectionTimeout = 10 * time.Second
+
 func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -30,6 +32,10 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 			_ = c.Close()
 		}
 	}()
+	if err := c.SetDeadline(time.Now().Add(initialConnectionTimeout)); err != nil {
+		logrus.Debugln("set initial deadline:", err)
+		return
+	}
 
 	var ok bool
 	c, ok = routeInitialConnection(ctx, c, s.fallbackAddr)
@@ -38,36 +44,22 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 	}
 	c = tls.Server(c, s.tlsConfig)
 
-	b := buf.NewPacket()
-	defer b.Release()
-
-	n, err := b.ReadOnceFrom(c)
-	if err != nil {
-		logrus.Debugln("ReadOnceFrom:", err)
-		return
-	}
-	c = bufio.NewCachedConn(c, b)
-
-	by, err := b.ReadBytes(32)
-	if err != nil || !bytes.Equal(by, passwordSha256) {
-		b.Resize(0, n)
-		fallback(ctx, c, s.fallbackAddr)
-		return
-	}
-	by, err = b.ReadBytes(2)
-	if err != nil {
-		b.Resize(0, n)
-		fallback(ctx, c, s.fallbackAddr)
-		return
-	}
-	paddingLen := binary.BigEndian.Uint16(by)
-	if paddingLen > 0 {
-		_, err = b.ReadBytes(int(paddingLen))
+	var authenticated, canFallback bool
+	var err error
+	c, authenticated, canFallback, err = authenticateConnection(c)
+	if !authenticated {
 		if err != nil {
-			b.Resize(0, n)
-			fallback(ctx, c, s.fallbackAddr)
-			return
+			logrus.Debugln("authenticate:", err)
 		}
+		if canFallback {
+			_ = c.SetDeadline(time.Time{})
+			fallback(ctx, c, s.fallbackAddr)
+		}
+		return
+	}
+	if err = c.SetDeadline(time.Time{}); err != nil {
+		logrus.Debugln("clear initial deadline:", err)
+		return
 	}
 
 	session := session.NewServerSession(c, func(stream *session.Stream) {
@@ -94,6 +86,32 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 	session.Close()
 }
 
+func authenticateConnection(c net.Conn) (net.Conn, bool, bool, error) {
+	request := make([]byte, 34)
+	n, err := io.ReadFull(c, request)
+	if err != nil {
+		return replayConnection(c, request[:n]), false, n > 0, err
+	}
+	if subtle.ConstantTimeCompare(request[:32], passwordSha256) != 1 {
+		return replayConnection(c, request), false, true, nil
+	}
+
+	paddingLen := int(binary.BigEndian.Uint16(request[32:]))
+	if paddingLen == 0 {
+		return c, true, false, nil
+	}
+	request = append(request, make([]byte, paddingLen)...)
+	n, err = io.ReadFull(c, request[34:])
+	if err != nil {
+		return replayConnection(c, request[:34+n]), false, true, err
+	}
+	return c, true, false, nil
+}
+
+func replayConnection(c net.Conn, data []byte) net.Conn {
+	return bufio.NewCachedConn(c, buf.As(data))
+}
+
 func routeInitialConnection(ctx context.Context, c net.Conn, fallbackAddr string) (net.Conn, bool) {
 	var firstByte [1]byte
 	n, err := c.Read(firstByte[:])
@@ -107,6 +125,7 @@ func routeInitialConnection(ctx context.Context, c net.Conn, fallbackAddr string
 
 	cachedConn := bufio.NewCachedConn(c, buf.As(firstByte[:n]))
 	if firstByte[0] != 0x16 {
+		_ = cachedConn.SetDeadline(time.Time{})
 		fallback(ctx, cachedConn, fallbackAddr)
 		return cachedConn, false
 	}

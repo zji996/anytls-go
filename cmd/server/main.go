@@ -58,11 +58,12 @@ func main() {
 		logrus.Fatalln("listen server tcp:", err)
 	}
 
-	tlsCert, _ := util.GenerateKeyPair(time.Now, "")
+	tlsCert, err := util.GenerateKeyPair(time.Now, "")
+	if err != nil {
+		logrus.Fatalln("generate TLS certificate:", err)
+	}
 	tlsConfig := &tls.Config{
-		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return tlsCert, nil
-		},
+		Certificates: []tls.Certificate{*tlsCert},
 	}
 
 	ctx := context.Background()
