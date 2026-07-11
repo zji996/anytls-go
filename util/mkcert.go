@@ -1,8 +1,9 @@
 package util
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -15,7 +16,7 @@ func GenerateKeyPair(timeFunc func() time.Time, serverName string) (*tls.Certifi
 	if timeFunc == nil {
 		timeFunc = time.Now
 	}
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
 	}

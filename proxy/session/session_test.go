@@ -1,17 +1,21 @@
 package session
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"anytls/proxy/padding"
 
 	"github.com/sagernet/sing/common/atomic"
+	"github.com/sagernet/sing/common/buf"
 )
 
 func TestSessionRoundTripOverNetPipe(t *testing.T) {
@@ -171,6 +175,11 @@ func TestSlowStreamReaderDoesNotBlockOtherStreams(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	for i := 0; i < 2; i++ {
+		if _, err := remote.Write(mustEncodeTestFrame(t, cmdPSH, 1, slowPayload)); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	fastPayload := []byte("fast")
 	if _, err := remote.Write(mustEncodeTestFrame(t, cmdPSH, 2, fastPayload)); err != nil {
@@ -196,12 +205,292 @@ func TestSlowStreamReaderDoesNotBlockOtherStreams(t *testing.T) {
 		t.Fatalf("fast stream read %q, want %q", string(buf), string(fastPayload))
 	}
 
+	_ = remote.SetReadDeadline(time.Now().Add(time.Second))
+	fin := readTestFrame(t, remote)
+	if fin.cmd != cmdFIN || fin.sid != slow.id {
+		t.Fatalf("overflow frame = command %d stream %d, want FIN for stream %d", fin.cmd, fin.sid, slow.id)
+	}
+	if _, err := slow.Read(make([]byte, 1)); !errors.Is(err, errStreamReceiveQueueFull) {
+		t.Fatalf("slow stream error = %v, want %v", err, errStreamReceiveQueueFull)
+	}
+
 	s.Close()
 	select {
 	case <-errCh:
 	case <-time.After(time.Second):
 		t.Fatal("recvLoop did not exit")
 	}
+}
+
+func TestInvalidFrameHeaderClosesSession(t *testing.T) {
+	tests := []struct {
+		name   string
+		cmd    byte
+		length uint16
+	}{
+		{name: "unknown command", cmd: 255},
+		{name: "FIN with data", cmd: cmdFIN, length: 1},
+		{name: "SYN with data", cmd: cmdSYN, length: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			local, remote := net.Pipe()
+			defer remote.Close()
+
+			s := NewClientSession(local, newTestPaddingFactory("stop=0"))
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- s.recvLoop()
+			}()
+
+			var hdr rawHeader
+			hdr[0] = tt.cmd
+			binary.BigEndian.PutUint16(hdr[5:], tt.length)
+			if _, err := remote.Write(hdr[:]); err != nil {
+				t.Fatal(err)
+			}
+
+			select {
+			case err := <-errCh:
+				if err == nil {
+					t.Fatal("recvLoop returned nil error")
+				}
+			case <-time.After(time.Second):
+				t.Fatal("recvLoop did not reject invalid frame")
+			}
+			if !s.IsClosed() {
+				t.Fatal("session remained open after invalid frame")
+			}
+		})
+	}
+}
+
+func TestDataWriteErrorClosesSession(t *testing.T) {
+	local, remote := net.Pipe()
+	remote.Close()
+
+	s := NewClientSession(local, newTestPaddingFactory("stop=0"))
+	if _, err := s.writeDataFrame(1, []byte("payload")); err == nil {
+		t.Fatal("writeDataFrame succeeded on a closed connection")
+	}
+	if !s.IsClosed() {
+		t.Fatal("session remained reusable after a data write error")
+	}
+}
+
+func TestStreamWriteDeadlineInterruptsBlockedWrite(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+
+	s := NewClientSession(local, newTestPaddingFactory("stop=0"))
+	stream := newStream(1, s)
+	if err := stream.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, err := stream.Write([]byte("blocked"))
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Write error = %v, want deadline exceeded", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("blocked Write was not interrupted promptly")
+	}
+	if !s.IsClosed() {
+		t.Fatal("session remained open after an interrupted frame write")
+	}
+}
+
+func TestSetWriteDeadlineInterruptsPendingWrite(t *testing.T) {
+	local, remote := net.Pipe()
+	defer remote.Close()
+
+	s := NewClientSession(local, newTestPaddingFactory("stop=0"))
+	stream := newStream(1, s)
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := stream.Write([]byte("blocked"))
+		writeErr <- err
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	if err := stream.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-writeErr:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("Write error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending Write was not interrupted")
+	}
+}
+
+func TestClearedWriteDeadlineDoesNotInterruptWrite(t *testing.T) {
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+
+	s := NewClientSession(local, newTestPaddingFactory("stop=0"))
+	stream := newStream(1, s)
+	if err := stream.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := stream.Write([]byte("payload"))
+		writeErr <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	if err := stream.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+
+	go io.CopyN(io.Discard, remote, int64(len("payload")+headerOverHeadSize))
+	select {
+	case err := <-writeErr:
+		if err != nil {
+			t.Fatalf("Write failed after clearing deadline: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write did not finish after clearing deadline")
+	}
+	if s.IsClosed() {
+		t.Fatal("session closed after clearing write deadline")
+	}
+}
+
+func TestStreamReadPartialChunks(t *testing.T) {
+	s := NewClientSession(&discardConn{}, newTestPaddingFactory("stop=0"))
+	stream := newStream(1, s)
+	defer stream.closeLocally()
+	if !stream.queueIncoming([]byte("abcdef")) {
+		t.Fatal("queueIncoming failed")
+	}
+
+	buffer := make([]byte, 2)
+	var got string
+	for range 3 {
+		n, err := stream.Read(buffer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got += string(buffer[:n])
+	}
+	if got != "abcdef" {
+		t.Fatalf("partial reads = %q, want abcdef", got)
+	}
+}
+
+func TestIdleSessionHeapReturnsHighestSequence(t *testing.T) {
+	client := &Client{}
+	for _, seq := range []uint64{2, 5, 1, 4, 3} {
+		session := NewClientSession(&discardConn{}, newTestPaddingFactory("stop=0"))
+		session.seq = seq
+		client.putIdleSession(session)
+	}
+	for want := uint64(5); want > 0; want-- {
+		session := client.getIdleSession()
+		if session == nil || session.seq != want {
+			t.Fatalf("getIdleSession sequence = %v, want %d", session, want)
+		}
+	}
+}
+
+func TestIdleCleanupKeepsNewestMinimum(t *testing.T) {
+	client := &Client{minIdleSession: 2}
+	for seq := uint64(1); seq <= 5; seq++ {
+		session := NewClientSession(&discardConn{}, newTestPaddingFactory("stop=0"))
+		session.seq = seq
+		client.putIdleSession(session)
+	}
+	client.idleCleanupExpTime(time.Now().Add(time.Hour))
+
+	for _, want := range []uint64{5, 4} {
+		session := client.getIdleSession()
+		if session == nil || session.seq != want {
+			t.Fatalf("remaining session sequence = %v, want %d", session, want)
+		}
+	}
+	if session := client.getIdleSession(); session != nil {
+		t.Fatalf("unexpected extra idle session: %d", session.seq)
+	}
+}
+
+func TestClientPrewarmCreatesIdleSessions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := NewClient(ctx, func(context.Context) (net.Conn, error) {
+		return newBlockingTestConn(), nil
+	}, newTestPaddingFactory("stop=0"), time.Hour, time.Hour, 0)
+	defer client.Close()
+
+	if err := client.Prewarm(ctx, 3); err != nil {
+		t.Fatal(err)
+	}
+	for want := uint64(3); want > 0; want-- {
+		session := client.getIdleSession()
+		if session == nil || session.seq != want {
+			t.Fatalf("prewarmed session sequence = %v, want %d", session, want)
+		}
+	}
+}
+
+func TestStreamExtendedBufferIO(t *testing.T) {
+	local, remote := net.Pipe()
+	defer local.Close()
+	defer remote.Close()
+
+	s := NewClientSession(local, newTestPaddingFactory("stop=0"))
+	stream := newStream(7, s)
+	payload := []byte("payload")
+	writeBuffer := buf.NewSize(headerOverHeadSize + len(payload))
+	writeBuffer.Resize(headerOverHeadSize, 0)
+	_, _ = writeBuffer.Write(payload)
+	writeErr := make(chan error, 1)
+	go func() {
+		writeErr <- stream.WriteBuffer(writeBuffer)
+	}()
+
+	frame := readTestFrame(t, remote)
+	if frame.cmd != cmdPSH || frame.sid != stream.id || string(frame.data) != string(payload) {
+		t.Fatalf("WriteBuffer frame = command %d stream %d data %q", frame.cmd, frame.sid, frame.data)
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatal(err)
+	}
+
+	if !stream.queueIncoming([]byte("response")) {
+		t.Fatal("queueIncoming failed")
+	}
+	readBuffer := buf.NewSize(32)
+	defer readBuffer.Release()
+	if err := stream.ReadBuffer(readBuffer); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(readBuffer.Bytes()); got != "response" {
+		t.Fatalf("ReadBuffer data = %q, want response", got)
+	}
+}
+
+func TestRemoteFINDrainsQueuedData(t *testing.T) {
+	s := NewClientSession(&discardConn{}, newTestPaddingFactory("stop=0"))
+	stream := newStream(1, s)
+	if !stream.queueIncoming([]byte("final payload")) {
+		t.Fatal("queueIncoming failed")
+	}
+	stream.closeRemotely()
+
+	data, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); got != "final payload" {
+		t.Fatalf("drained data = %q, want final payload", got)
+	}
+	_ = stream.Close()
 }
 
 func TestWriteDataFrameSplitsLargePayload(t *testing.T) {
@@ -297,6 +586,28 @@ type testFrame struct {
 	sid  uint32
 	data []byte
 }
+
+type blockingTestConn struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func newBlockingTestConn() *blockingTestConn {
+	return &blockingTestConn{done: make(chan struct{})}
+}
+
+func (c *blockingTestConn) Read([]byte) (int, error) {
+	<-c.done
+	return 0, io.EOF
+}
+
+func (*blockingTestConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (c *blockingTestConn) Close() error                   { c.once.Do(func() { close(c.done) }); return nil }
+func (*blockingTestConn) LocalAddr() net.Addr              { return nil }
+func (*blockingTestConn) RemoteAddr() net.Addr             { return nil }
+func (*blockingTestConn) SetDeadline(time.Time) error      { return nil }
+func (*blockingTestConn) SetReadDeadline(time.Time) error  { return nil }
+func (*blockingTestConn) SetWriteDeadline(time.Time) error { return nil }
 
 func readTestFrame(t *testing.T, r io.Reader) testFrame {
 	t.Helper()

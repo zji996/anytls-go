@@ -2,14 +2,37 @@ package session
 
 import (
 	"anytls/proxy/pipe"
+	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/sagernet/sing/common/buf"
 )
 
 const streamReceiveQueueSize = 16
+
+var errStreamReceiveQueueFull = errors.New("stream receive queue full")
+
+type incomingChunk struct {
+	data   []byte
+	pooled bool
+}
+
+func (c *incomingChunk) release() {
+	if c.pooled && c.data != nil {
+		_ = buf.Put(c.data)
+	}
+	c.data = nil
+}
+
+type streamError struct {
+	err error
+}
 
 // Stream implements net.Conn
 type Stream struct {
@@ -17,16 +40,24 @@ type Stream struct {
 
 	sess *Session
 
-	pipeR         *pipe.PipeReader
-	pipeW         *pipe.PipeWriter
-	recvCh        chan []byte
+	readMu        sync.Mutex
+	readChunk     incomingChunk
+	readOffset    int
+	recvMu        sync.Mutex
+	recvCh        chan incomingChunk
 	recvDone      chan struct{}
 	recvCloseOnce sync.Once
+	remoteDone    chan struct{}
+	remoteOnce    sync.Once
+	readDeadline  pipe.PipeDeadline
 	writeDeadline pipe.PipeDeadline
+	writesActive  atomic.Int32
+	writeWatching atomic.Bool
+	writeState    chan struct{}
 
 	dieOnce sync.Once
 	dieHook func()
-	dieErr  error
+	dieErr  atomic.Pointer[streamError]
 
 	reportOnce sync.Once
 }
@@ -36,35 +67,144 @@ func newStream(id uint32, sess *Session) *Stream {
 	s := new(Stream)
 	s.id = id
 	s.sess = sess
-	s.pipeR, s.pipeW = pipe.Pipe()
-	s.recvCh = make(chan []byte, streamReceiveQueueSize)
+	s.recvCh = make(chan incomingChunk, streamReceiveQueueSize)
 	s.recvDone = make(chan struct{})
+	s.remoteDone = make(chan struct{})
+	s.readDeadline = pipe.MakePipeDeadline()
 	s.writeDeadline = pipe.MakePipeDeadline()
-	go s.recvLoop()
+	s.writeState = make(chan struct{}, 1)
 	return s
 }
 
 // Read implements net.Conn
 func (s *Stream) Read(b []byte) (n int, err error) {
-	n, err = s.pipeR.Read(b)
-	if n == 0 && s.dieErr != nil {
-		err = s.dieErr
+	if len(b) == 0 {
+		return 0, nil
 	}
-	return
+
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+	for {
+		if s.readOffset < len(s.readChunk.data) {
+			n = copy(b, s.readChunk.data[s.readOffset:])
+			s.readOffset += n
+			if s.readOffset == len(s.readChunk.data) {
+				s.readChunk.release()
+				s.readOffset = 0
+			}
+			return n, nil
+		}
+		select {
+		case chunk := <-s.recvCh:
+			s.readChunk = chunk
+			s.readOffset = 0
+			continue
+		default:
+		}
+
+		select {
+		case <-s.recvDone:
+			return 0, s.readCloseError()
+		case <-s.sess.die:
+			return 0, s.readCloseError()
+		case <-s.readDeadline.Wait():
+			return 0, os.ErrDeadlineExceeded
+		case <-s.remoteDone:
+			return 0, io.EOF
+		default:
+		}
+
+		select {
+		case chunk := <-s.recvCh:
+			s.readChunk = chunk
+			s.readOffset = 0
+		case <-s.recvDone:
+			return 0, s.readCloseError()
+		case <-s.sess.die:
+			return 0, s.readCloseError()
+		case <-s.readDeadline.Wait():
+			return 0, os.ErrDeadlineExceeded
+		case <-s.remoteDone:
+			continue
+		}
+	}
 }
 
 // Write implements net.Conn
 func (s *Stream) Write(b []byte) (n int, err error) {
+	deadline := s.writeDeadline.Wait()
 	select {
-	case <-s.writeDeadline.Wait():
+	case <-deadline:
 		return 0, os.ErrDeadlineExceeded
 	default:
 	}
-	if s.dieErr != nil {
-		return 0, s.dieErr
+	if dieErr := s.loadDieErr(); dieErr != nil {
+		return 0, dieErr
 	}
+
+	s.beginWrite()
+	defer s.endWrite()
+
 	n, err = s.sess.writeDataFrame(s.id, b)
+	select {
+	case <-deadline:
+		return n, os.ErrDeadlineExceeded
+	default:
+	}
 	return
+}
+
+func (s *Stream) ReadBuffer(buffer *buf.Buffer) error {
+	if buffer.FreeLen() == 0 {
+		return io.ErrShortBuffer
+	}
+	n, err := s.Read(buffer.FreeBytes())
+	buffer.Extend(n)
+	if n > 0 {
+		return nil
+	}
+	return err
+}
+
+func (s *Stream) WriteBuffer(buffer *buf.Buffer) error {
+	defer buffer.Release()
+	if buffer.Len() == 0 {
+		return nil
+	}
+	if buffer.Len() > maxFrameDataLen || buffer.Start() < headerOverHeadSize {
+		_, err := s.Write(buffer.Bytes())
+		return err
+	}
+
+	deadline := s.writeDeadline.Wait()
+	select {
+	case <-deadline:
+		return os.ErrDeadlineExceeded
+	default:
+	}
+	if dieErr := s.loadDieErr(); dieErr != nil {
+		return dieErr
+	}
+
+	payloadLen := buffer.Len()
+	header := buffer.ExtendHeader(headerOverHeadSize)
+	header[0] = cmdPSH
+	binary.BigEndian.PutUint32(header[1:5], s.id)
+	binary.BigEndian.PutUint16(header[5:7], uint16(payloadLen))
+
+	s.beginWrite()
+	defer s.endWrite()
+	err := s.sess.writeEncodedPayloadFrame(buffer.Bytes())
+	select {
+	case <-deadline:
+		return os.ErrDeadlineExceeded
+	default:
+	}
+	return err
+}
+
+func (s *Stream) FrontHeadroom() int {
+	return headerOverHeadSize
 }
 
 // Close implements net.Conn
@@ -74,11 +214,29 @@ func (s *Stream) Close() error {
 
 // closeLocally only closes Stream and don't notify remote peer
 func (s *Stream) closeLocally() {
+	s.closeLocallyWithError(net.ErrClosed)
+}
+
+func (s *Stream) closeRemotely() {
 	var once bool
 	s.dieOnce.Do(func() {
-		s.dieErr = net.ErrClosed
+		s.storeDieErr(net.ErrClosed)
+		s.remoteOnce.Do(func() {
+			close(s.remoteDone)
+		})
+		once = true
+	})
+	if once && s.dieHook != nil {
+		s.dieHook()
+		s.dieHook = nil
+	}
+}
+
+func (s *Stream) closeLocallyWithError(err error) bool {
+	var once bool
+	s.dieOnce.Do(func() {
+		s.storeDieErr(err)
 		s.closeReceiveQueue()
-		s.pipeR.Close()
 		once = true
 	})
 	if once {
@@ -86,15 +244,17 @@ func (s *Stream) closeLocally() {
 			s.dieHook()
 			s.dieHook = nil
 		}
+	} else {
+		s.closeReceiveQueue()
 	}
+	return once
 }
 
 func (s *Stream) closeWithError(err error) error {
 	var once bool
 	s.dieOnce.Do(func() {
-		s.dieErr = err
+		s.storeDieErr(err)
 		s.closeReceiveQueue()
-		s.pipeR.Close()
 		once = true
 	})
 	if once {
@@ -104,49 +264,93 @@ func (s *Stream) closeWithError(err error) error {
 		}
 		return s.sess.streamClosed(s.id)
 	} else {
-		return s.dieErr
+		s.closeReceiveQueue()
+		return s.loadDieErr()
 	}
 }
 
 func (s *Stream) queueIncoming(data []byte) bool {
+	return s.queueIncomingChunk(incomingChunk{data: data})
+}
+
+func (s *Stream) queueIncomingPooled(data []byte) bool {
+	return s.queueIncomingChunk(incomingChunk{data: data, pooled: true})
+}
+
+func (s *Stream) queueIncomingChunk(chunk incomingChunk) bool {
+	s.recvMu.Lock()
+	defer s.recvMu.Unlock()
 	select {
-	case s.recvCh <- data:
+	case <-s.recvDone:
+		return false
+	case <-s.sess.die:
+		return false
+	default:
+	}
+
+	select {
+	case s.recvCh <- chunk:
 		return true
 	case <-s.recvDone:
 		return false
 	case <-s.sess.die:
 		return false
-	}
-}
-
-func (s *Stream) recvLoop() {
-	defer s.pipeW.Close()
-	for {
-		select {
-		case data := <-s.recvCh:
-			if len(data) > 0 {
-				_, _ = s.pipeW.Write(data)
-			}
-		case <-s.recvDone:
-			return
-		case <-s.sess.die:
-			return
-		}
+	default:
+		return false
 	}
 }
 
 func (s *Stream) closeReceiveQueue() {
 	s.recvCloseOnce.Do(func() {
+		s.recvMu.Lock()
 		close(s.recvDone)
+		s.recvMu.Unlock()
+		s.readMu.Lock()
+		s.readChunk.release()
+		s.readOffset = 0
+		for {
+			select {
+			case chunk := <-s.recvCh:
+				chunk.release()
+			default:
+				s.readMu.Unlock()
+				return
+			}
+		}
 	})
 }
 
+func (s *Stream) loadDieErr() error {
+	if state := s.dieErr.Load(); state != nil {
+		return state.err
+	}
+	return nil
+}
+
+func (s *Stream) storeDieErr(err error) {
+	s.dieErr.Store(&streamError{err: err})
+}
+
+func (s *Stream) readCloseError() error {
+	if err := s.loadDieErr(); err != nil {
+		return err
+	}
+	return net.ErrClosed
+}
+
 func (s *Stream) SetReadDeadline(t time.Time) error {
-	return s.pipeR.SetReadDeadline(t)
+	if s.loadDieErr() != nil {
+		return io.ErrClosedPipe
+	}
+	s.readDeadline.Set(t)
+	return nil
 }
 
 func (s *Stream) SetWriteDeadline(t time.Time) error {
 	s.writeDeadline.Set(t)
+	if !t.IsZero() && s.writesActive.Load() > 0 {
+		s.ensureWriteDeadlineWatcher()
+	}
 	return nil
 }
 
@@ -155,6 +359,63 @@ func (s *Stream) SetDeadline(t time.Time) error {
 		return err
 	}
 	return s.SetReadDeadline(t)
+}
+
+func (s *Stream) beginWrite() {
+	if s.writesActive.Add(1) == 1 {
+		select {
+		case <-s.writeState:
+		default:
+		}
+	}
+	if !s.writeDeadline.Deadline().IsZero() {
+		s.ensureWriteDeadlineWatcher()
+	}
+}
+
+func (s *Stream) endWrite() {
+	if s.writesActive.Add(-1) == 0 {
+		select {
+		case s.writeState <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (s *Stream) ensureWriteDeadlineWatcher() {
+	if !s.writeWatching.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer func() {
+			s.writeWatching.Store(false)
+			if s.writesActive.Load() > 0 && !s.writeDeadline.Deadline().IsZero() {
+				s.ensureWriteDeadlineWatcher()
+			}
+		}()
+		for {
+			if s.writeDeadline.Deadline().IsZero() {
+				return
+			}
+			deadline := s.writeDeadline.Wait()
+			select {
+			case <-deadline:
+				if s.writeDeadline.Wait() != deadline {
+					continue
+				}
+				if s.writesActive.Load() > 0 {
+					_ = s.sess.Close()
+				}
+				return
+			case <-s.writeState:
+				if s.writesActive.Load() == 0 {
+					return
+				}
+			case <-s.sess.die:
+				return
+			}
+		}
+	}()
 }
 
 // LocalAddr satisfies net.Conn interface

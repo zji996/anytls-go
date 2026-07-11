@@ -4,12 +4,14 @@ import (
 	"anytls/proxy/padding"
 	"anytls/util"
 	"crypto/md5"
+	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"io"
+	randv2 "math/rand/v2"
 	"net"
 	"os"
 	"runtime/debug"
-	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -37,9 +39,12 @@ type Session struct {
 	synDoneLock sync.Mutex
 
 	// pool
-	seq       uint64
-	idleSince time.Time
-	padding   *atomic.TypedValue[*padding.PaddingFactory]
+	seq        uint64
+	idleSince  time.Time
+	idleIndex  int
+	padding    *atomic.TypedValue[*padding.PaddingFactory]
+	paddingRNG randv2.ChaCha8
+	paddingBuf [16]int
 
 	peerVersion byte
 
@@ -55,11 +60,15 @@ type Session struct {
 }
 
 func NewClientSession(conn net.Conn, _padding *atomic.TypedValue[*padding.PaddingFactory]) *Session {
+	var randomSeed [32]byte
+	_, _ = rand.Read(randomSeed[:])
 	s := &Session{
 		conn:        conn,
 		isClient:    true,
 		sendPadding: true,
 		padding:     _padding,
+		idleIndex:   -1,
+		paddingRNG:  *randv2.NewChaCha8(randomSeed),
 	}
 	s.die = make(chan struct{})
 	s.streams = make(map[uint32]*Stream)
@@ -71,6 +80,7 @@ func NewServerSession(conn net.Conn, onNewStream func(stream *Stream), _padding 
 		conn:        conn,
 		onNewStream: onNewStream,
 		padding:     _padding,
+		idleIndex:   -1,
 	}
 	s.die = make(chan struct{})
 	s.streams = make(map[uint32]*Stream)
@@ -91,6 +101,7 @@ func (s *Session) Run() {
 	f := newFrame(cmdSettings, 0)
 	f.data = settings.ToBytes()
 	s.buffering = true
+	s.buffer = make([]byte, 0, 512)
 	s.writeControlFrame(f)
 
 	go s.recvLoop()
@@ -122,7 +133,7 @@ func (s *Session) Close() error {
 		for _, stream := range s.streams {
 			stream.closeLocally()
 		}
-		s.streams = make(map[uint32]*Stream)
+		clear(s.streams)
 		s.streamLock.Unlock()
 		return s.conn.Close()
 	} else {
@@ -196,6 +207,9 @@ func (s *Session) recvLoop() error {
 		}
 		// read header first
 		if _, err := io.ReadFull(s.conn, hdr[:]); err == nil {
+			if err := validateFrameHeader(hdr); err != nil {
+				return err
+			}
 			sid := hdr.StreamID()
 			switch hdr.Cmd() {
 			case cmdPSH:
@@ -206,13 +220,17 @@ func (s *Session) recvLoop() error {
 						stream, ok := s.streams[sid]
 						s.streamLock.RUnlock()
 						if ok {
-							data := make([]byte, len(buffer))
-							copy(data, buffer)
-							stream.queueIncoming(data)
+							if stream.queueIncomingPooled(buffer) {
+								buffer = nil
+							} else {
+								s.closeOverflowedStream(stream)
+							}
 						}
-						buf.Put(buffer)
+						if buffer != nil {
+							_ = buf.Put(buffer)
+						}
 					} else {
-						buf.Put(buffer)
+						_ = buf.Put(buffer)
 						return err
 					}
 				}
@@ -264,7 +282,7 @@ func (s *Session) recvLoop() error {
 				delete(s.streams, sid)
 				s.streamLock.Unlock()
 				if ok {
-					stream.closeLocally()
+					stream.closeRemotely()
 				}
 				//logrus.Debugln("stream fin", sid, s.streams)
 			case cmdWaste:
@@ -374,6 +392,18 @@ func (s *Session) recvLoop() error {
 	}
 }
 
+func (s *Session) closeOverflowedStream(stream *Stream) {
+	if !stream.closeLocallyWithError(errStreamReceiveQueueFull) {
+		return
+	}
+	s.streamLock.Lock()
+	if s.streams[stream.id] == stream {
+		delete(s.streams, stream.id)
+	}
+	s.streamLock.Unlock()
+	go s.writeControlFrame(newFrame(cmdFIN, stream.id))
+}
+
 func (s *Session) streamClosed(sid uint32) error {
 	if s.IsClosed() {
 		return io.ErrClosedPipe
@@ -400,24 +430,42 @@ func (s *Session) writeDataFrame(sid uint32, data []byte) (int, error) {
 }
 
 func (s *Session) writePayloadFrame(sid uint32, data []byte) error {
-	buffer, err := encodeFrameRaw(cmdPSH, sid, data)
-	if err != nil {
-		return err
+	frameLen := len(data) + headerOverHeadSize
+	buffer := buf.Get(frameLen)
+	pooled := len(buffer) == frameLen
+	if !pooled {
+		buffer = make([]byte, frameLen)
 	}
-	_, err = s.writeConn(buffer.Bytes())
-	buffer.Release()
+	encodeFrameInto(buffer, cmdPSH, sid, data)
+	_, err := s.writeConn(buffer)
+	if pooled {
+		_ = buf.Put(buffer)
+	}
+	if err != nil {
+		_ = s.Close()
+	}
+	return err
+}
+
+func (s *Session) writeEncodedPayloadFrame(data []byte) error {
+	_, err := s.writeConn(data)
+	if err != nil {
+		_ = s.Close()
+	}
 	return err
 }
 
 func (s *Session) writeControlFrame(frame frame) (int, error) {
 	dataLen := len(frame.data)
-	buffer, err := encodeFrame(frame)
-	if err != nil {
-		return 0, err
+	if dataLen > maxFrameDataLen {
+		return 0, fmt.Errorf("frame data too large: %d", dataLen)
 	}
-
-	_, err = s.writeConnWithDeadline(buffer.Bytes(), time.Now().Add(time.Second*5))
-	buffer.Release()
+	buffer, pooled := borrowBuffer(dataLen + headerOverHeadSize)
+	encodeFrameInto(buffer, frame.cmd, frame.sid, frame.data)
+	_, err := s.writeConnWithDeadline(buffer, time.Now().Add(time.Second*5))
+	if pooled {
+		_ = buf.Put(buffer)
+	}
 	if err != nil {
 		s.Close()
 		return 0, err
@@ -441,10 +489,11 @@ func (s *Session) writeConnWithDeadline(b []byte, deadline time.Time) (n int, er
 	}
 
 	if s.buffering {
-		s.buffer = slices.Concat(s.buffer, b)
+		s.buffer = append(s.buffer, b...)
 		return len(b), nil
 	} else if len(s.buffer) > 0 {
-		b = slices.Concat(s.buffer, b)
+		s.buffer = append(s.buffer, b...)
+		b = s.buffer
 		s.buffer = nil
 	}
 
@@ -453,7 +502,7 @@ func (s *Session) writeConnWithDeadline(b []byte, deadline time.Time) (n int, er
 		pkt := s.pktCounter.Add(1)
 		paddingF := s.padding.Load()
 		if pkt < paddingF.Stop {
-			pktSizes := paddingF.GenerateRecordPayloadSizes(pkt)
+			pktSizes := paddingF.GenerateRecordPayloadSizesWithRNGInto(pkt, &s.paddingRNG, s.paddingBuf[:])
 			for _, l := range pktSizes {
 				remainPayloadLen := len(b)
 				if l == padding.CheckMark {
@@ -474,11 +523,22 @@ func (s *Session) writeConnWithDeadline(b []byte, deadline time.Time) (n int, er
 				} else if remainPayloadLen > 0 { // this packet contains padding and the last part of payload
 					paddingLen := l - remainPayloadLen - headerOverHeadSize
 					if paddingLen > 0 {
-						padding := make([]byte, headerOverHeadSize+paddingLen)
-						padding[0] = cmdWaste
-						binary.BigEndian.PutUint32(padding[1:5], 0)
-						binary.BigEndian.PutUint16(padding[5:7], uint16(paddingLen))
-						b = slices.Concat(b, padding)
+						combined, pooled := borrowBuffer(remainPayloadLen + headerOverHeadSize + paddingLen)
+						copy(combined, b)
+						paddingHeader := combined[remainPayloadLen:]
+						paddingHeader[0] = cmdWaste
+						binary.BigEndian.PutUint32(paddingHeader[1:5], 0)
+						binary.BigEndian.PutUint16(paddingHeader[5:7], uint16(paddingLen))
+						_, err = s.conn.Write(combined)
+						if pooled {
+							_ = buf.Put(combined)
+						}
+						if err != nil {
+							return 0, err
+						}
+						n += remainPayloadLen
+						b = nil
+						continue
 					}
 					_, err = s.conn.Write(b)
 					if err != nil {
@@ -487,11 +547,14 @@ func (s *Session) writeConnWithDeadline(b []byte, deadline time.Time) (n int, er
 					n += remainPayloadLen
 					b = nil
 				} else { // this packet is all padding
-					padding := make([]byte, headerOverHeadSize+l)
+					padding, pooled := borrowBuffer(headerOverHeadSize + l)
 					padding[0] = cmdWaste
 					binary.BigEndian.PutUint32(padding[1:5], 0)
 					binary.BigEndian.PutUint16(padding[5:7], uint16(l))
 					_, err = s.conn.Write(padding)
+					if pooled {
+						_ = buf.Put(padding)
+					}
 					if err != nil {
 						return 0, err
 					}
@@ -511,4 +574,12 @@ func (s *Session) writeConnWithDeadline(b []byte, deadline time.Time) (n int, er
 	}
 
 	return s.conn.Write(b)
+}
+
+func borrowBuffer(size int) ([]byte, bool) {
+	buffer := buf.Get(size)
+	if len(buffer) == size {
+		return buffer, true
+	}
+	return make([]byte, size), false
 }

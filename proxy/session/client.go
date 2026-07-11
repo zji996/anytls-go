@@ -4,15 +4,15 @@ import (
 	"anytls/proxy/padding"
 	"anytls/util"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
-	"github.com/chen3feng/stl4go"
 	"github.com/sagernet/sing/common/atomic"
 	"github.com/sirupsen/logrus"
 )
@@ -28,7 +28,7 @@ type Client struct {
 
 	sessionCounter atomic.Uint64
 
-	idleSession     *stl4go.SkipList[uint64, *Session]
+	idleSessions    []*Session
 	idleSessionLock sync.Mutex
 
 	sessions     map[uint64]*Session
@@ -57,7 +57,6 @@ func NewClient(ctx context.Context, dialOut util.DialOutFunc,
 		c.idleSessionTimeout = time.Second * 30
 	}
 	c.die, c.dieCancel = context.WithCancel(ctx)
-	c.idleSession = stl4go.NewSkipList[uint64, *Session]()
 	util.StartRoutine(c.die, idleSessionCheckInterval, c.idleCleanup)
 	return c
 }
@@ -110,10 +109,7 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 				// Now client has been closed
 				go session.Close()
 			default:
-				c.idleSessionLock.Lock()
-				session.idleSince = time.Now()
-				c.idleSession.Insert(math.MaxUint64-session.seq, session)
-				c.idleSessionLock.Unlock()
+				c.putIdleSession(session)
 			}
 		} else {
 			if clientDebugSessionPool {
@@ -125,21 +121,87 @@ func (c *Client) CreateStream(ctx context.Context) (net.Conn, error) {
 	return stream, nil
 }
 
+func (c *Client) Prewarm(ctx context.Context, count int) error {
+	if count <= 0 {
+		return nil
+	}
+	count = min(count, 64)
+	workerCount := min(count, 4)
+	jobs := make(chan struct{}, count)
+	for range count {
+		jobs <- struct{}{}
+	}
+	close(jobs)
+
+	var waitGroup sync.WaitGroup
+	var errorLock sync.Mutex
+	var warmupErrors []error
+	for range workerCount {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			for range jobs {
+				session, err := c.createSession(ctx)
+				if err != nil {
+					errorLock.Lock()
+					warmupErrors = append(warmupErrors, err)
+					errorLock.Unlock()
+					continue
+				}
+				select {
+				case <-c.die.Done():
+					_ = session.Close()
+				case <-ctx.Done():
+					_ = session.Close()
+				default:
+					c.putIdleSession(session)
+				}
+			}
+		}()
+	}
+	waitGroup.Wait()
+	return errors.Join(warmupErrors...)
+}
+
 func (c *Client) getIdleSession() (idle *Session) {
 	c.idleSessionLock.Lock()
-	if !c.idleSession.IsEmpty() {
-		it := c.idleSession.Iterate()
-		idle = it.Value()
-		c.idleSession.Remove(it.Key())
+	for len(c.idleSessions) > 0 {
+		idle = c.idleSessions[0]
+		c.removeIdleSessionLocked(0)
+		if !idle.IsClosed() {
+			break
+		}
+		idle = nil
 	}
 	c.idleSessionLock.Unlock()
 	return
+}
+
+func (c *Client) putIdleSession(session *Session) {
+	c.idleSessionLock.Lock()
+	defer c.idleSessionLock.Unlock()
+	if session.IsClosed() {
+		return
+	}
+	if session.idleIndex >= 0 {
+		return
+	}
+	session.idleSince = time.Now()
+	session.idleIndex = len(c.idleSessions)
+	c.idleSessions = append(c.idleSessions, session)
+	c.idleSessionBubbleUp(session.idleIndex)
 }
 
 func (c *Client) createSession(ctx context.Context) (*Session, error) {
 	underlying, err := c.dialOut(ctx)
 	if err != nil {
 		return nil, err
+	}
+	select {
+	case <-c.die.Done():
+		_ = underlying.Close()
+		return nil, io.ErrClosedPipe
+	default:
 	}
 
 	session := NewClientSession(underlying, c.padding)
@@ -150,7 +212,9 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 		}
 
 		c.idleSessionLock.Lock()
-		c.idleSession.Remove(math.MaxUint64 - session.seq)
+		if session.idleIndex >= 0 {
+			c.removeIdleSessionLocked(session.idleIndex)
+		}
 		c.idleSessionLock.Unlock()
 
 		c.sessionsLock.Lock()
@@ -159,8 +223,15 @@ func (c *Client) createSession(ctx context.Context) (*Session, error) {
 	}
 
 	c.sessionsLock.Lock()
-	c.sessions[session.seq] = session
-	c.sessionsLock.Unlock()
+	select {
+	case <-c.die.Done():
+		c.sessionsLock.Unlock()
+		_ = session.Close()
+		return nil, io.ErrClosedPipe
+	default:
+		c.sessions[session.seq] = session
+		c.sessionsLock.Unlock()
+	}
 
 	session.Run()
 	return session, nil
@@ -174,7 +245,7 @@ func (c *Client) Close() error {
 	for _, session := range c.sessions {
 		sessionToClose = append(sessionToClose, session)
 	}
-	c.sessions = make(map[uint64]*Session)
+	clear(c.sessions)
 	c.sessionsLock.Unlock()
 
 	for _, session := range sessionToClose {
@@ -189,33 +260,25 @@ func (c *Client) idleCleanup() {
 }
 
 func (c *Client) idleCleanupExpTime(expTime time.Time) {
-	activeCount := 0
 	var sessionToClose []*Session
 
 	c.idleSessionLock.Lock()
-	it := c.idleSession.Iterate()
-	for it.IsNotEnd() {
-		session := it.Value()
-		key := it.Key()
-		it.MoveToNext()
-
+	expired := make([]*Session, 0, len(c.idleSessions))
+	for _, session := range c.idleSessions {
 		if clientDebugSessionPool {
 			logrus.Debugln("check session:", session.seq, expTime, session.idleSince)
 		}
-
-		if !session.idleSince.Before(expTime) {
-			activeCount++
-			continue
+		if session.idleSince.Before(expTime) {
+			expired = append(expired, session)
 		}
-
-		if activeCount < c.minIdleSession {
-			session.idleSince = time.Now()
-			activeCount++
-			continue
-		}
-
+	}
+	sort.Slice(expired, func(i, j int) bool {
+		return expired[i].seq < expired[j].seq
+	})
+	closeCount := min(len(expired), max(0, len(c.idleSessions)-c.minIdleSession))
+	for _, session := range expired[:closeCount] {
 		sessionToClose = append(sessionToClose, session)
-		c.idleSession.Remove(key)
+		c.removeIdleSessionLocked(session.idleIndex)
 	}
 	c.idleSessionLock.Unlock()
 
@@ -225,4 +288,61 @@ func (c *Client) idleCleanupExpTime(expTime time.Time) {
 		}
 		session.Close()
 	}
+}
+
+func (c *Client) removeIdleSessionLocked(index int) *Session {
+	removed := c.idleSessions[index]
+	last := len(c.idleSessions) - 1
+	if index != last {
+		c.idleSessions[index] = c.idleSessions[last]
+		c.idleSessions[index].idleIndex = index
+	}
+	c.idleSessions[last] = nil
+	c.idleSessions = c.idleSessions[:last]
+	removed.idleIndex = -1
+	if index < len(c.idleSessions) {
+		if !c.idleSessionBubbleUp(index) {
+			c.idleSessionBubbleDown(index)
+		}
+	}
+	return removed
+}
+
+func (c *Client) idleSessionBubbleUp(index int) bool {
+	moved := false
+	for index > 0 {
+		parent := (index - 1) / 2
+		if c.idleSessions[parent].seq >= c.idleSessions[index].seq {
+			break
+		}
+		c.swapIdleSessions(parent, index)
+		index = parent
+		moved = true
+	}
+	return moved
+}
+
+func (c *Client) idleSessionBubbleDown(index int) {
+	for {
+		left := index*2 + 1
+		if left >= len(c.idleSessions) {
+			return
+		}
+		largest := left
+		right := left + 1
+		if right < len(c.idleSessions) && c.idleSessions[right].seq > c.idleSessions[left].seq {
+			largest = right
+		}
+		if c.idleSessions[index].seq >= c.idleSessions[largest].seq {
+			return
+		}
+		c.swapIdleSessions(index, largest)
+		index = largest
+	}
+}
+
+func (c *Client) swapIdleSessions(i, j int) {
+	c.idleSessions[i], c.idleSessions[j] = c.idleSessions[j], c.idleSessions[i]
+	c.idleSessions[i].idleIndex = i
+	c.idleSessions[j].idleIndex = j
 }

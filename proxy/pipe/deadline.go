@@ -10,6 +10,7 @@ type PipeDeadline struct {
 	mu     sync.Mutex // Guards timer and cancel
 	timer  *time.Timer
 	cancel chan struct{} // Must be non-nil
+	value  time.Time
 }
 
 func MakePipeDeadline() PipeDeadline {
@@ -30,6 +31,7 @@ func (d *PipeDeadline) Set(t time.Time) {
 		<-d.cancel // Wait for the timer callback to finish and close cancel
 	}
 	d.timer = nil
+	d.value = t
 
 	// Time is zero, then there is no deadline.
 	closed := isClosedChan(d.cancel)
@@ -55,6 +57,12 @@ func (d *PipeDeadline) Set(t time.Time) {
 	if !closed {
 		close(d.cancel)
 	}
+}
+
+func (d *PipeDeadline) Deadline() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.value
 }
 
 // Wait returns a channel that is closed when the deadline is exceeded.

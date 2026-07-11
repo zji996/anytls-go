@@ -6,13 +6,18 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	randv2 "math/rand/v2"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/sagernet/sing/common/atomic"
 )
 
-const CheckMark = -1
+const (
+	CheckMark      = -1
+	MaxPaddingSize = 1<<16 - 1
+)
 
 var defaultPaddingScheme = []byte(`stop=8
 0=30-30
@@ -64,6 +69,7 @@ func UpdatePaddingFactory(factory *atomic.TypedValue[*PaddingFactory], rawScheme
 }
 
 func NewPaddingFactory(rawScheme []byte) *PaddingFactory {
+	rawScheme = slices.Clone(rawScheme)
 	p := &PaddingFactory{
 		RawScheme: rawScheme,
 		Md5:       fmt.Sprintf("%x", md5.Sum(rawScheme)),
@@ -72,18 +78,37 @@ func NewPaddingFactory(rawScheme []byte) *PaddingFactory {
 	if len(scheme) == 0 {
 		return nil
 	}
-	if stop, err := strconv.Atoi(scheme["stop"]); err == nil {
+	if stop, err := strconv.ParseUint(scheme["stop"], 10, 32); err == nil {
 		p.Stop = uint32(stop)
 	} else {
 		return nil
 	}
 	p.scheme = scheme
-	p.rules = compileRules(scheme)
+	var ok bool
+	p.rules, ok = compileRules(scheme)
+	if !ok {
+		return nil
+	}
+	if authRules := p.rules[0]; len(authRules) > 0 && (len(authRules) != 1 || authRules[0].check) {
+		return nil
+	}
 	p.fixed = compileFixedSizes(p.rules)
 	return p
 }
 
 func (p *PaddingFactory) GenerateRecordPayloadSizes(pkt uint32) (pktSizes []int) {
+	return p.generateRecordPayloadSizes(pkt, nil, nil)
+}
+
+func (p *PaddingFactory) GenerateRecordPayloadSizesWithRNG(pkt uint32, rng *randv2.ChaCha8) []int {
+	return p.generateRecordPayloadSizes(pkt, rng, nil)
+}
+
+func (p *PaddingFactory) GenerateRecordPayloadSizesWithRNGInto(pkt uint32, rng *randv2.ChaCha8, destination []int) []int {
+	return p.generateRecordPayloadSizes(pkt, rng, destination)
+}
+
+func (p *PaddingFactory) generateRecordPayloadSizes(pkt uint32, rng *randv2.ChaCha8, destination []int) (pktSizes []int) {
 	rules := p.rules[pkt]
 	if len(rules) == 0 {
 		return nil
@@ -91,12 +116,18 @@ func (p *PaddingFactory) GenerateRecordPayloadSizes(pkt uint32) (pktSizes []int)
 	if fixed, ok := p.fixed[pkt]; ok {
 		return fixed
 	}
-	pktSizes = make([]int, 0, len(rules))
+	if cap(destination) >= len(rules) {
+		pktSizes = destination[:0]
+	} else {
+		pktSizes = make([]int, 0, len(rules))
+	}
 	for _, rule := range rules {
 		if rule.check {
 			pktSizes = append(pktSizes, CheckMark)
 		} else if rule.min == rule.max {
 			pktSizes = append(pktSizes, rule.min)
+		} else if rng != nil {
+			pktSizes = append(pktSizes, randomIntFromUint64(rule.min, rule.max, rng.Uint64()))
 		} else {
 			pktSizes = append(pktSizes, randomInt(rule.min, rule.max))
 		}
@@ -104,12 +135,15 @@ func (p *PaddingFactory) GenerateRecordPayloadSizes(pkt uint32) (pktSizes []int)
 	return
 }
 
-func compileRules(scheme util.StringMap) map[uint32][]paddingRule {
+func compileRules(scheme util.StringMap) (map[uint32][]paddingRule, bool) {
 	rules := make(map[uint32][]paddingRule)
 	for key, value := range scheme {
+		if key == "stop" {
+			continue
+		}
 		pkt, err := strconv.ParseUint(key, 10, 32)
 		if err != nil {
-			continue
+			return nil, false
 		}
 		for _, rawRule := range strings.Split(value, ",") {
 			if rawRule == "c" {
@@ -118,12 +152,12 @@ func compileRules(scheme util.StringMap) map[uint32][]paddingRule {
 			}
 			minValue, maxValue, ok := parseRange(rawRule)
 			if !ok {
-				continue
+				return nil, false
 			}
 			rules[uint32(pkt)] = append(rules[uint32(pkt)], paddingRule{min: minValue, max: maxValue})
 		}
 	}
-	return rules
+	return rules, true
 }
 
 func compileFixedSizes(rules map[uint32][]paddingRule) map[uint32][]int {
@@ -162,7 +196,7 @@ func parseRange(raw string) (int, int, bool) {
 		return 0, 0, false
 	}
 	minValue64, maxValue64 = min(minValue64, maxValue64), max(minValue64, maxValue64)
-	if minValue64 <= 0 || maxValue64 <= 0 {
+	if minValue64 <= 0 || maxValue64 <= 0 || maxValue64 > MaxPaddingSize {
 		return 0, 0, false
 	}
 	return int(minValue64), int(maxValue64), true
@@ -177,5 +211,13 @@ func randomInt(minValue int, maxValue int) int {
 	if _, err := rand.Read(b[:]); err != nil {
 		return minValue
 	}
-	return minValue + int(binary.LittleEndian.Uint64(b[:])%uint64(delta))
+	return randomIntFromUint64(minValue, maxValue, binary.LittleEndian.Uint64(b[:]))
+}
+
+func randomIntFromUint64(minValue int, maxValue int, random uint64) int {
+	delta := maxValue - minValue
+	if delta <= 0 {
+		return minValue
+	}
+	return minValue + int(random%uint64(delta))
 }

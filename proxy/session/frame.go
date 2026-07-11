@@ -38,10 +38,6 @@ func newFrame(cmd byte, sid uint32) frame {
 	return frame{cmd: cmd, sid: sid}
 }
 
-func encodeFrame(f frame) (*buf.Buffer, error) {
-	return encodeFrameRaw(f.cmd, f.sid, f.data)
-}
-
 func encodeFrameRaw(cmd byte, sid uint32, data []byte) (*buf.Buffer, error) {
 	dataLen := len(data)
 	if dataLen > maxFrameDataLen {
@@ -49,11 +45,15 @@ func encodeFrameRaw(cmd byte, sid uint32, data []byte) (*buf.Buffer, error) {
 	}
 
 	buffer := buf.NewSize(dataLen + headerOverHeadSize)
-	buffer.WriteByte(cmd)
-	binary.BigEndian.PutUint32(buffer.Extend(4), sid)
-	binary.BigEndian.PutUint16(buffer.Extend(2), uint16(dataLen))
-	buffer.Write(data)
+	encodeFrameInto(buffer.Extend(dataLen+headerOverHeadSize), cmd, sid, data)
 	return buffer, nil
+}
+
+func encodeFrameInto(buffer []byte, cmd byte, sid uint32, data []byte) {
+	buffer[0] = cmd
+	binary.BigEndian.PutUint32(buffer[1:5], sid)
+	binary.BigEndian.PutUint16(buffer[5:7], uint16(len(data)))
+	copy(buffer[headerOverHeadSize:], data)
 }
 
 func newRemoteError(message string) error {
@@ -72,4 +72,19 @@ func (h rawHeader) StreamID() uint32 {
 
 func (h rawHeader) Length() uint16 {
 	return binary.BigEndian.Uint16(h[5:])
+}
+
+func validateFrameHeader(h rawHeader) error {
+	switch h.Cmd() {
+	case cmdSYN, cmdFIN, cmdHeartRequest, cmdHeartResponse:
+		if h.Length() != 0 {
+			return fmt.Errorf("command %d must not carry data", h.Cmd())
+		}
+	case cmdWaste, cmdPSH, cmdSettings, cmdAlert, cmdUpdatePaddingScheme, cmdSYNACK, cmdServerSettings:
+		// These commands may carry data. Command-specific validation happens
+		// after the payload has been read.
+	default:
+		return fmt.Errorf("unknown command: %d", h.Cmd())
+	}
+	return nil
 }

@@ -15,13 +15,14 @@ func StartRoutine(ctx context.Context, d time.Duration, f func()) {
 				logrus.Errorln("[BUG]", r, string(debug.Stack()))
 			}
 		}()
+		ticker := time.NewTicker(d)
+		defer ticker.Stop()
 		for {
-			time.Sleep(d)
-			f()
 			select {
 			case <-ctx.Done():
 				return
-			default:
+			case <-ticker.C:
+				f()
 			}
 		}
 	}()
