@@ -56,6 +56,10 @@ func (c *myClient) Prewarm(ctx context.Context, count int) error {
 	return c.sessionClient.Prewarm(ctx, count)
 }
 
+func (c *myClient) Close() error {
+	return c.sessionClient.Close()
+}
+
 func (c *myClient) createOutboundConnection(ctx context.Context) (net.Conn, error) {
 	conn, err := c.dialOut(ctx)
 	if err != nil {
