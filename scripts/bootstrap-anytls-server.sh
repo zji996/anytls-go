@@ -110,22 +110,25 @@ normalize_repo_url() {
 install_packages() {
   if command -v apt-get >/dev/null 2>&1; then
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git tar gzip python3
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git tar gzip python3 util-linux
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ca-certificates curl git tar gzip python3
+    dnf install -y ca-certificates curl git tar gzip python3 util-linux
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y ca-certificates curl git tar gzip python3
+    yum install -y ca-certificates curl git tar gzip python3 util-linux
   elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache ca-certificates curl git tar gzip python3
+    apk add --no-cache ca-certificates curl git tar gzip python3 util-linux
   else
-    echo "unsupported package manager; please install ca-certificates curl git tar gzip python3 manually" >&2
+    echo "unsupported package manager; please install ca-certificates curl git tar gzip python3 util-linux manually" >&2
     exit 1
   fi
 }
 
 ensure_go() {
   local required_version installed_version
-  required_version="$(awk '/^go / { print $2; exit }' "$install_dir/go.mod" 2>/dev/null || true)"
+  required_version="${1:-}"
+  if [[ -z "$required_version" ]]; then
+    required_version="$(awk '/^go / { print $2; exit }' "$install_dir/go.mod" 2>/dev/null || true)"
+  fi
   required_version="${required_version:-1.24.0}"
   if command -v go >/dev/null 2>&1; then
     installed_version="$(go env GOVERSION 2>/dev/null | sed 's/^go//' || true)"
@@ -214,25 +217,29 @@ bootstrap_main() {
   install_packages
   validate_inputs
 
+  local existing_checkout=0 requested_action="${installer_args[0]:-menu}" required_go=""
   if [[ -d "$install_dir/.git" ]]; then
+    existing_checkout=1
     local existing_repo_url current_branch
     existing_repo_url="$(git -C "$install_dir" remote get-url origin 2>/dev/null || true)"
     if [[ "$(normalize_repo_url "$existing_repo_url")" != "$(normalize_repo_url "$repo_url")" ]]; then
       echo "refusing to update $install_dir: origin is '$existing_repo_url', expected '$repo_url'" >&2
       exit 1
     fi
-    if [[ -n "$(git -C "$install_dir" status --porcelain)" ]]; then
-      echo "refusing to update $install_dir: working tree has local changes or untracked files" >&2
-      exit 1
-    fi
-    echo "updating source tree: $install_dir"
-    git -C "$install_dir" fetch origin "$branch:refs/remotes/origin/$branch"
     current_branch="$(git -C "$install_dir" branch --show-current)"
-    if [[ "$current_branch" != "$branch" ]]; then
-      echo "refusing to switch branch automatically: current '$current_branch', requested '$branch'" >&2
-      exit 1
+    if [[ "$requested_action" == "install" || "$requested_action" == "update" ]]; then
+      if [[ -n "$(git -C "$install_dir" status --porcelain)" ]]; then
+        echo "refusing to update $install_dir: working tree has local changes or untracked files" >&2
+        exit 1
+      fi
+      if [[ "$current_branch" != "$branch" ]]; then
+        echo "refusing to switch branch automatically: current '$current_branch', requested '$branch'" >&2
+        exit 1
+      fi
+      echo "fetching candidate source: $install_dir"
+      git -C "$install_dir" fetch origin "$branch:refs/remotes/origin/$branch"
+      required_go="$(git -C "$install_dir" show "origin/$branch:go.mod" | awk '/^go / { print $2; exit }')"
     fi
-    git -C "$install_dir" merge --ff-only "origin/$branch"
   else
     local parent_dir install_name clone_dir
     if [[ -e "$install_dir" ]] && [[ -n "$(find "$install_dir" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
@@ -256,13 +263,19 @@ bootstrap_main() {
   touch "$install_dir/.anytls-bootstrap-managed"
   grep -qxF '/.anytls-bootstrap-managed' "$install_dir/.git/info/exclude" 2>/dev/null || printf '%s\n' '/.anytls-bootstrap-managed' >>"$install_dir/.git/info/exclude"
 
-  ensure_go
+  if [[ "$existing_checkout" -eq 0 || "$requested_action" == "install" || "$requested_action" == "update" ]]; then
+    ensure_go "$required_go"
+  fi
 
-  echo "pre-downloading Go modules..."
-  (
-    cd "$install_dir"
-    go mod download
-  )
+  if [[ "$existing_checkout" -eq 0 ]]; then
+    echo "pre-downloading Go modules..."
+    (
+      cd "$install_dir"
+      go mod download
+    )
+  elif [[ "$requested_action" == "install" ]]; then
+    installer_args[0]="update"
+  fi
 
   echo
   echo "starting installer..."
