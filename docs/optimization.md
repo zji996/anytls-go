@@ -64,7 +64,7 @@ go test -run '^$' -bench . -benchmem ./proxy/session
 - 临时服务端证书改用 ECDSA P-256，减少完整 TLS 握手的签名成本和证书体积。
 - 服务端支持认证失败 fallback 和明文 TCP 探测 fallback。
 - 部署脚本支持菜单、随机密码、更新、状态查看、卸载和 `doctor` 自检。
-- 本地 `net.Pipe` 测试覆盖 session 往返、padding 更新、握手失败传播和慢 reader 隔离。
+- 本地 `net.Pipe` 测试覆盖 session 往返、padding 更新、握手失败传播和接收队列背压下的完整交付。
 
 ## 当前性能数据
 

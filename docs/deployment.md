@@ -58,7 +58,8 @@ bootstrap 自动安装基础依赖后，服务器最终需要：
 
 - Linux amd64/arm64 服务器。
 - systemd，用于常驻运行 `anytls-server`。
-- Go 1.24 或更新版本，用于在服务器上从源码构建。bootstrap 会自动安装 Go；如果使用预编译二进制部署，则服务器不需要 Go。
+- Go 1.24 或更新版本，用于构建服务端和一次性健康探针客户端。bootstrap 会自动安装 Go；即使通过 `--binary` 指定服务端，当前安装器仍会从同一源码构建临时 probe client。
+- util-linux 提供的 `flock`，用于阻止并发安装、更新、重启或卸载；bootstrap 会自动安装。
 - 一个 TCP 端口，例如 `8443/tcp` 或 `443/tcp`。
 
 可选依赖：
@@ -89,7 +90,7 @@ sudo ./scripts/install-anytls-server.sh -p '你的密码' -l 0.0.0.0:8443 -s you
 - `-s` / `--server-name`：生成客户端 URI 时使用的服务器域名或 IP。
 - `--branch`：源码构建时期望的 git 分支，默认 `zji-dev`。
 - `--fallback`：认证失败时反代的地址，默认 `127.0.0.1:80`。
-- `--binary`：使用已有 `anytls-server` 二进制安装，跳过服务器现场编译。
+- `--binary`：使用已有 `anytls-server` 二进制，服务端不再现场编译，但仍会构建临时 probe client。
 - `--padding-scheme`：可选，安装自定义 PaddingScheme 文件。
 - `--no-firewall`：不自动修改本机防火墙规则。
 - `--non-interactive`：不提示输入；未传密码时自动生成随机密码。
@@ -105,7 +106,9 @@ sudo ./scripts/install-anytls-server.sh -p '你的密码' -l 0.0.0.0:8443 -s you
 
 服务默认使用专用的 `anytls` 系统用户运行。密码单独保存在 `server.password`，不会写入 systemd 的 `ExecStart` 参数或非敏感环境文件；配置目录仅允许 root 和 `anytls` 组读取。监听 443 等低端口时只授予 `CAP_NET_BIND_SERVICE`，不会以 root 身份运行服务。
 
-安装和重装使用临时构建与原子文件替换。新二进制会先通过服务端包测试，systemd 重启和监听检查失败时自动恢复原二进制、配置和 unit。`doctor` 对服务未启用、未运行、文件缺失或端口未监听返回非零退出码，适合用于自动化部署判断。
+安装和重装支持覆盖已经运行的同名历史安装。未显式传参时会保留密码、监听地址、server name、fallback 和 PaddingScheme；旧版 env 中的密码会迁移到独立密码文件。候选版本先运行全量 Go/安装流程测试并在临时目录构建，目标文件通过同目录 rename 原子替换，最后只执行一次 service restart，因此已有 AnyTLS session 会在切换时中断。
+
+备份完成后，文件替换、systemd、退出信号、MainPID 稳定性检查、真实 AnyTLS 数据往返探针或 `doctor` 任一步失败都会恢复原二进制、配置、unit、服务启用/运行状态和本次新建的用户。回滚本身失败时会保留备份目录并明确要求人工恢复。所有可变更服务状态的动作共用部署锁，第二个并发操作会以退出码 75 拒绝执行。
 
 常用管理命令：
 
@@ -126,7 +129,7 @@ sudo journalctl -u anytls-server -f
 - 重启服务。
 - 卸载服务和配置。
 
-更新操作先把远端提交放入临时 Git worktree，并用候选源码完成测试、构建和部署；只有候选服务通过检查后，主源码目录才会快进到新提交。存在已跟踪的本地修改、分支不一致或历史分叉时会拒绝自动更新。
+更新操作先把远端提交放入临时 Git worktree，只生成候选 staging。当前安装器持有旧服务备份，候选服务通过 MainPID 稳定检查、真实 TLS/认证/开流/代理数据往返和 `doctor` 后，主源码目录才会快进并提交服务事务。源码推进失败也会恢复旧服务。存在已跟踪、未跟踪或暂存修改、分支不一致或历史分叉时会拒绝自动更新。
 
 安装脚本会尽量自动放行本机防火墙：
 
@@ -134,13 +137,13 @@ sudo journalctl -u anytls-server -f
 - `firewalld` 已运行时执行永久端口规则并 reload。
 - 没有 `ufw` / `firewalld` 但存在 `iptables` 时，添加运行时 ACCEPT 规则；这类规则可能不会在重启后保留。
 
-脚本只记录和管理自己新增的防火墙规则。更换监听端口时会删除旧的受管规则，卸载时也会清理；安装前已经存在的规则不会被删除。使用 `--no-firewall` 时，已有受管规则保持不变。
+脚本只记录和管理自己新增的防火墙规则。更换监听端口时会先确认新规则成功，再删除旧的受管规则；新增失败时安装保持成功，但旧规则和状态记录会保留，并输出手工放行警告。安装前已经存在的规则不会被删除。使用 `--no-firewall` 时，已有受管规则保持不变。
 
 云厂商安全组或供应商防火墙无法从 VPS 内可靠修改，仍需要在控制台手动放行对应 TCP 端口。若不希望脚本修改本机防火墙，可加 `--no-firewall`。
 
-bootstrap 会拒绝覆盖已有的非 Git 目录，也会核对已有仓库的 `origin`、当前分支和工作区状态。通过 bootstrap 创建的源码目录会被标记为受管目录，执行卸载时一并删除；Go 工具链和系统软件包可能被其他程序共用，因此卸载不会删除它们。
+bootstrap 会拒绝覆盖已有的非 Git 目录并始终核对已有仓库的 `origin`。install/update 还会检查当前分支和工作区状态；status、doctor、restart、uninstall 和 menu 不 fetch/merge 源码，也不因本地改动而拒绝管理现有服务。通过 bootstrap 创建的源码目录会被标记为受管目录，执行卸载时一并删除；Go 工具链和系统软件包可能被其他程序共用，因此卸载不会删除它们。
 
-仓库内可用隔离测试验证安装、凭据文件、健康检查、失败回滚和卸载流程，不会操作真实 systemd 或防火墙：
+仓库内可用隔离测试验证首次安装、运行中覆盖、旧密码迁移、部署锁、凭据文件、健康检查、文件/systemd 失败回滚、防火墙切换、源码更新校验和卸载，不会操作真实 systemd 或防火墙：
 
 ```
 ./scripts/test-installation.sh

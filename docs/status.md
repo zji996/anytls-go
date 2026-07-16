@@ -65,7 +65,7 @@ sudo /opt/anytls-go/scripts/install-anytls-server.sh doctor
 - 临时 TLS 证书使用 ECDSA P-256。
 - 服务端支持认证失败 fallback。
 - 服务端支持明文 TCP 探测 fallback，首包会转发到 fallback 后端。
-- 部署脚本支持 TUI 菜单、随机密码、事务式安装/回滚、候选 worktree 更新、状态查看、卸载和可返回失败状态的 `doctor` 自检。
+- 部署脚本支持运行中覆盖、部署锁、原子文件替换、退出 trap 回滚、候选 worktree 两阶段更新、真实 AnyTLS 健康探针、状态查看、卸载和可返回失败状态的 `doctor` 自检。
 - 服务使用专用系统用户和独立密码文件运行，密码不出现在 systemd `ExecStart` 参数中。
 - 部署脚本会尝试自动放行本机防火墙监听端口，记录自身新增的规则，并在改端口或卸载时清理。
 - 提供客户端侧 AnyTLS/Vision 对比脚本，方便在同一台 VPS 上实测首包和吞吐差异。
@@ -75,8 +75,9 @@ sudo /opt/anytls-go/scripts/install-anytls-server.sh doctor
 本机已通过以下检查：
 
 ```
-bash -n scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh
-shellcheck scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh
+bash -n scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh scripts/test-installation.sh
+shellcheck scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh scripts/test-installation.sh
+bash scripts/test-installation.sh
 go test ./...
 go vet ./...
 go test -race ./...

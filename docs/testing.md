@@ -33,7 +33,7 @@ go test -race ./...
 
 ```
 bash -n scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh
-shellcheck scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh
+shellcheck scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh scripts/test-installation.sh
 ```
 
 服务端 fallback 本地测试在 `cmd/server` 中覆盖：明文 TCP 探测应被转发到 fallback，并且首包数据不会丢失。
@@ -41,7 +41,11 @@ shellcheck scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh
 
 ```
 go test ./cmd/server -count=1 -v
+go test ./cmd/client -count=1 -v
+./scripts/test-installation.sh
 ```
+
+客户端测试还覆盖一次性 `-probe` 模式。实际安装时，该模式会在本机创建临时 echo 目标，经 TLS、AnyTLS 认证、stream 和服务端出站完成随机 payload 往返，不占用默认 SOCKS 端口。
 
 ## 性能基线
 

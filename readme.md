@@ -101,6 +101,14 @@ sudo /opt/anytls-go/scripts/install-anytls-server.sh
 
 预热默认关闭，避免在不需要时额外建立连接。
 
+服务端安装流程使用客户端的一次性真实健康探针；也可手工执行：
+
+```
+./anytls-client -probe -s 服务器ip:端口 -password-file /path/to/password
+```
+
+探针不监听 SOCKS 端口，会经 AnyTLS 建立 stream 并完成随机 payload 往返，成功返回退出码 0。
+
 v0.0.12 版本起，示例客户端可直接使用 URI 格式:
 
 ```
