@@ -222,8 +222,6 @@ func (s *Session) recvLoop() error {
 						if ok {
 							if stream.queueIncomingPooled(buffer) {
 								buffer = nil
-							} else {
-								s.closeOverflowedStream(stream)
 							}
 						}
 						if buffer != nil {
@@ -390,18 +388,6 @@ func (s *Session) recvLoop() error {
 			return err
 		}
 	}
-}
-
-func (s *Session) closeOverflowedStream(stream *Stream) {
-	if !stream.closeLocallyWithError(errStreamReceiveQueueFull) {
-		return
-	}
-	s.streamLock.Lock()
-	if s.streams[stream.id] == stream {
-		delete(s.streams, stream.id)
-	}
-	s.streamLock.Unlock()
-	go s.writeControlFrame(newFrame(cmdFIN, stream.id))
 }
 
 func (s *Session) streamClosed(sid uint32) error {

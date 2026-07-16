@@ -51,8 +51,8 @@ sudo /opt/anytls-go/scripts/install-anytls-server.sh doctor
 - 服务器下发的 PaddingScheme 只更新当前 Client，不污染进程全局默认值。
 - PaddingScheme 在加载时预编译规则，减少运行时 split/parse/分配。
 - frame 编码逻辑集中到 `proxy/session/frame.go`。
-- 每个 stream 增加有界接收队列，降低单个慢 reader 阻塞整个 session 的概率。
-- 接收队列溢出时淘汰单个 stream，避免反压扩散到同一 session 的其他 stream。
+- 每个 stream 增加有界接收队列，吸收 reader 的短时调度抖动并限制内存占用。
+- 接收队列满时对 session 接收施加可取消的 TCP 背压，避免把正常大流量传输截断为成功关流。
 - 数据 frame 写失败后立即关闭 session，避免损坏连接返回空闲池。
 - Stream 写 deadline 会中断阻塞写，Stream 终止状态支持并发访问。
 - 未知 command、非法 command data 和越界 PaddingScheme 会被拒绝。

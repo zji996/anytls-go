@@ -258,4 +258,4 @@ anytls 协议参数不包括 TLS 的参数。应该在另外的配置分区中�
 - 客户端在发送 `cmdSYN` 前先注册本地 stream，避免服务器快速返回 `cmdSYNACK` 时丢失状态。
 - `cmdUpdatePaddingScheme` 更新 Client 级别的 padding factory，不再污染进程全局默认 padding。
 - 控制帧写超时与底层写入在同一写锁内执行，避免连接级 deadline 影响并发数据帧写入。
-- 接收侧使用每 stream 有界队列解耦，减少慢 reader 对其他 stream 的影响；队列满后仍通过 TCP 背压限制内存增长。
+- 接收侧使用每 stream 有界队列吸收短时调度抖动；队列满后通过 TCP 背压限制内存增长并保证完整交付，不会将队列溢出伪装成正常关流。

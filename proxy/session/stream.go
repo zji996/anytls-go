@@ -3,7 +3,6 @@ package session
 import (
 	"anytls/proxy/pipe"
 	"encoding/binary"
-	"errors"
 	"io"
 	"net"
 	"os"
@@ -15,8 +14,6 @@ import (
 )
 
 const streamReceiveQueueSize = 16
-
-var errStreamReceiveQueueFull = errors.New("stream receive queue full")
 
 type incomingChunk struct {
 	data   []byte
@@ -295,15 +292,15 @@ func (s *Stream) queueIncomingChunk(chunk incomingChunk) bool {
 		return false
 	case <-s.sess.die:
 		return false
-	default:
-		return false
 	}
 }
 
 func (s *Stream) closeReceiveQueue() {
 	s.recvCloseOnce.Do(func() {
-		s.recvMu.Lock()
+		// Wake a producer blocked on a full queue before waiting for it to
+		// release recvMu. The mutex then fences any final enqueue before drain.
 		close(s.recvDone)
+		s.recvMu.Lock()
 		s.recvMu.Unlock()
 		s.readMu.Lock()
 		s.readChunk.release()

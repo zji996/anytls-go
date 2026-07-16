@@ -148,7 +148,7 @@ func TestSessionHandshakeFailurePropagates(t *testing.T) {
 	}
 }
 
-func TestSlowStreamReaderDoesNotBlockOtherStreams(t *testing.T) {
+func TestReceiveQueueBackpressurePreservesStreamData(t *testing.T) {
 	local, remote := net.Pipe()
 	defer local.Close()
 	defer remote.Close()
@@ -157,10 +157,10 @@ func TestSlowStreamReaderDoesNotBlockOtherStreams(t *testing.T) {
 	s := NewClientSession(local, paddingFactory)
 	defer s.Close()
 
-	slow := newStream(1, s)
+	stream := newStream(1, s)
 	fast := newStream(2, s)
 	s.streamLock.Lock()
-	s.streams[1] = slow
+	s.streams[1] = stream
 	s.streams[2] = fast
 	s.streamLock.Unlock()
 
@@ -169,49 +169,50 @@ func TestSlowStreamReaderDoesNotBlockOtherStreams(t *testing.T) {
 		errCh <- s.recvLoop()
 	}()
 
-	slowPayload := []byte("slow")
-	for i := 0; i < streamReceiveQueueSize; i++ {
-		if _, err := remote.Write(mustEncodeTestFrame(t, cmdPSH, 1, slowPayload)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for i := 0; i < 2; i++ {
-		if _, err := remote.Write(mustEncodeTestFrame(t, cmdPSH, 1, slowPayload)); err != nil {
-			t.Fatal(err)
-		}
-	}
-
+	streamPayload := []byte("data")
 	fastPayload := []byte("fast")
-	if _, err := remote.Write(mustEncodeTestFrame(t, cmdPSH, 2, fastPayload)); err != nil {
-		t.Fatal(err)
-	}
-
-	buf := make([]byte, len(fastPayload))
-	done := make(chan error, 1)
+	streamFrame := mustEncodeTestFrame(t, cmdPSH, stream.id, streamPayload)
+	fastFrame := mustEncodeTestFrame(t, cmdPSH, fast.id, fastPayload)
+	frameCount := streamReceiveQueueSize + 2
+	writeDone := make(chan error, 1)
 	go func() {
-		_, err := io.ReadFull(fast, buf)
-		done <- err
+		for i := 0; i < frameCount; i++ {
+			if _, err := remote.Write(streamFrame); err != nil {
+				writeDone <- err
+				return
+			}
+		}
+		_, err := remote.Write(fastFrame)
+		writeDone <- err
 	}()
 
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("fast stream read was blocked by slow stream")
+	case err := <-writeDone:
+		t.Fatalf("writer was not backpressured by the full receive queue: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	want := strings.Repeat(string(streamPayload), frameCount)
+	got := make([]byte, len(want))
+	if _, err := io.ReadFull(stream, got); err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != want {
+		t.Fatalf("stream read %q, want %q", string(got), want)
+	}
+
+	buf := make([]byte, len(fastPayload))
+	if _, err := io.ReadFull(fast, buf); err != nil {
+		t.Fatal(err)
 	}
 	if string(buf) != string(fastPayload) {
 		t.Fatalf("fast stream read %q, want %q", string(buf), string(fastPayload))
 	}
-
-	_ = remote.SetReadDeadline(time.Now().Add(time.Second))
-	fin := readTestFrame(t, remote)
-	if fin.cmd != cmdFIN || fin.sid != slow.id {
-		t.Fatalf("overflow frame = command %d stream %d, want FIN for stream %d", fin.cmd, fin.sid, slow.id)
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
 	}
-	if _, err := slow.Read(make([]byte, 1)); !errors.Is(err, errStreamReceiveQueueFull) {
-		t.Fatalf("slow stream error = %v, want %v", err, errStreamReceiveQueueFull)
+	if s.IsClosed() {
+		t.Fatal("session closed while applying receive backpressure")
 	}
 
 	s.Close()
@@ -219,6 +220,45 @@ func TestSlowStreamReaderDoesNotBlockOtherStreams(t *testing.T) {
 	case <-errCh:
 	case <-time.After(time.Second):
 		t.Fatal("recvLoop did not exit")
+	}
+}
+
+func TestStreamCloseUnblocksFullReceiveQueue(t *testing.T) {
+	s := NewClientSession(&discardConn{}, newTestPaddingFactory("stop=0"))
+	stream := newStream(1, s)
+	for i := 0; i < streamReceiveQueueSize; i++ {
+		if !stream.queueIncoming([]byte("queued")) {
+			t.Fatal("queueIncoming failed before queue reached capacity")
+		}
+	}
+
+	queued := make(chan bool, 1)
+	go func() {
+		queued <- stream.queueIncoming([]byte("blocked"))
+	}()
+	select {
+	case <-queued:
+		t.Fatal("queueIncoming did not block on a full receive queue")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		stream.closeLocally()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("stream close was blocked by receive backpressure")
+	}
+	select {
+	case ok := <-queued:
+		if ok {
+			t.Fatal("queueIncoming succeeded after stream close")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queueIncoming remained blocked after stream close")
 	}
 }
 

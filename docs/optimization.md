@@ -47,8 +47,8 @@ go test -run '^$' -bench . -benchmem ./proxy/session
 - PaddingScheme 更新收敛到 Client 实例，不污染进程全局默认值。
 - PaddingScheme 在加载时预编译规则，运行时不再重复 split/parse。
 - frame 编码逻辑集中到 `frame.go`，减少数据帧和控制帧重复实现。
-- 接收侧增加每 stream 有界队列，避免单个慢 reader 直接阻塞 session 接收循环。
-- 接收队列溢出时只关闭对应 stream，不再让慢 reader 阻塞整个 session。
+- 接收侧增加每 stream 有界队列，吸收 reader 的短时调度抖动并限制内存占用。
+- 接收队列满时对 session 接收施加可取消的背压，不丢弃 stream 或伪装成正常结束，确保大流量传输完整交付。
 - 数据帧写失败会立即关闭 session，避免复用已经产生半帧的连接。
 - Stream 写 deadline 可以中断正在等待或执行的底层写入。
 - frame command/length 和 PaddingScheme 范围增加严格校验。
@@ -85,7 +85,7 @@ go test -run '^$' -bench . -benchmem ./proxy/session
 
 ## 后续可做但需要单独评估的优化
 
-- 接收队列策略调优：根据真实压力测试调整队列大小和溢出淘汰阈值。
+- 逐 stream 滑动窗口：需要扩展协议，让发送端只暂停慢 stream，避免当前 TCP 背压影响同一 session 的其他 stream。
 - 下行 padding：可用现有 `cmdWaste` 实现，但应默认关闭或只在 `stealth` profile 中开启。
 - padding profile：以配置方式切换速度/安全取舍，不改变协议格式。
 - 本地 TCP + TLS 持续吞吐 benchmark：当前 net.Pipe 和 TLS 握手基准已覆盖，仍需补长期本地回环与真实 VPS 数据。

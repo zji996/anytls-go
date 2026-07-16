@@ -14,7 +14,7 @@ go vet ./...
 ## Session 本地集成测试
 
 `proxy/session` 的集成测试使用 `net.Pipe` 模拟一条本地连接，覆盖 `Session.Run`、`OpenStream`、`Stream.Read`、`Stream.Write`、`cmdSYNACK` 错误传播和 Client 级 PaddingScheme 更新。
-测试还覆盖慢 reader 场景：一个 stream 的接收队列溢出后应关闭该 stream，且不阻塞其他 stream 的数据交付。
+测试还覆盖慢 reader 场景：接收队列满后应产生可取消的背压，reader 恢复消费后所有 stream 数据仍须完整、按序交付。
 畸形 frame、底层写失败、阻塞写 deadline 和并发关闭状态也包含在本地测试中。
 
 ```
