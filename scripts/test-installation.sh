@@ -6,6 +6,9 @@ installer="$script_dir/install-anytls-server.sh"
 test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT
 
+# Prevent mock uninstall test from wiping out the actual repository
+export ANYTLS_TEST_MODE=1
+
 # shellcheck disable=SC1090
 ANYTLS_INSTALLER_LIB_ONLY=1 source "$installer"
 # shellcheck disable=SC2317

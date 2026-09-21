@@ -426,7 +426,7 @@ run_candidate_tests() {
       go mod download &&
       go test ./... &&
       bash -n scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh scripts/test-installation.sh &&
-      ANYTLS_SKIP_CANDIDATE_TESTS=1 bash scripts/test-installation.sh
+      ANYTLS_DEPLOYMENT_LOCK_HELD=0 ANYTLS_SKIP_CANDIDATE_TESTS=1 bash scripts/test-installation.sh
   ); then
     return 1
   fi
@@ -1250,7 +1250,7 @@ do_uninstall() {
   if [[ "$remove_service_user" -eq 1 ]]; then
     userdel "$service_user" >/dev/null 2>&1 || deluser "$service_user" >/dev/null 2>&1 || true
   fi
-  if [[ -f "$repo_root/.anytls-bootstrap-managed" && "$repo_root" != "/" && "$repo_root" != "$HOME" ]]; then
+  if [[ -f "$repo_root/.anytls-bootstrap-managed" && "$repo_root" != "/" && "$repo_root" != "$HOME" && "${ANYTLS_TEST_MODE:-0}" != "1" ]]; then
     echo "removing bootstrap-managed source checkout: $repo_root"
     rm -rf "$repo_root" || return 1
   fi
