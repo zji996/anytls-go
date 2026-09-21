@@ -34,3 +34,5 @@ trace.out
 # Local logs and editor state
 *.log
 .vscode
+.anytls-bootstrap-managed
+
