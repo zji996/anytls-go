@@ -141,7 +141,8 @@ type encoder struct {
 	inflight    atomic.Int64
 	// origin, if set, sends a framed request straight to its origin when the
 	// decoder cannot be reached.
-	origin http.RoundTripper
+	origin   http.RoundTripper
+	compress compression
 }
 
 // A path with no decoder (frpc pointed straight at the origin) answers without
@@ -285,7 +286,7 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request body read failed", http.StatusBadRequest)
 		return
 	}
-	res, err := encodeFrame(body, e.known)
+	res, err := encodeFrame(body, e.known, e.compress)
 	if err != nil {
 		log.Printf("encode: %v; sending plain", err)
 		e.stats.plain.Add(1)

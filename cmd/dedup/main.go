@@ -85,6 +85,7 @@ func runFront(args []string) {
 	indexMiB := fs.Int64("index-mib", 512, "content indexed as held by the decoder; keep below its -cache-mib")
 	maxBodyMiB := fs.Int64("max-body-mib", 64, "largest body that is deduplicated; larger ones pass through")
 	inflightMiB := fs.Int64("inflight-mib", 128, "memory for bodies being deduplicated; others pass through")
+	compressFlag := fs.String("compress", "auto", "CPU for content the decoder lacks: auto, huffman (cheaper) or off (cache only)")
 	probe := fs.Duration("probe-interval", 15*time.Second, "decoder health check interval")
 	fs.Parse(args)
 	if *via == "" || *caDir == "" {
@@ -119,6 +120,9 @@ func runFront(args []string) {
 
 	enc := newEncoder(route{url: decURL, via: viaURL}, *indexMiB<<20, *maxBodyMiB<<20)
 	enc.maxInflight = *inflightMiB << 20
+	if enc.compress, err = parseCompression(*compressFlag); err != nil {
+		log.Fatal(err)
+	}
 	direct := newProxy(route{via: viaURL})
 	enc.origin = direct.Transport
 	f := newFront(list, ca, dial, enc, direct)

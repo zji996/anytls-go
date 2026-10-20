@@ -26,8 +26,30 @@ type encodeResult struct {
 	refHashes []digest
 }
 
+// compression is how much CPU a frame's new content gets. References to
+// cached chunks cost the same in every mode.
+type compression int
+
+const (
+	compressAuto    compression = iota // BestSpeed, HuffmanOnly where BestSpeed stores
+	compressHuffman                    // HuffmanOnly: cheap, but text shrinks about half as much
+	compressOff                        // stored deflate blocks: only the cache saves bytes
+)
+
+func parseCompression(s string) (compression, error) {
+	switch s {
+	case "auto":
+		return compressAuto, nil
+	case "huffman":
+		return compressHuffman, nil
+	case "off":
+		return compressOff, nil
+	}
+	return 0, fmt.Errorf("unknown compression %q, want auto, huffman or off", s)
+}
+
 // encodeFrame replaces chunks the peer is believed to hold with references.
-func encodeFrame(body []byte, known *lru) (encodeResult, error) {
+func encodeFrame(body []byte, known *lru, mode compression) (encodeResult, error) {
 	var res encodeResult
 	// Sized once: like readBody, growing multi-MiB buffers stalls small routers.
 	// A record is at most a varint longer than its chunk.
@@ -51,13 +73,20 @@ func encodeFrame(body []byte, known *lru) (encodeResult, error) {
 		res.litBytes += len(piece)
 	}
 	records.WriteByte('E')
-	frame, err := deflate(records.Bytes(), flate.BestSpeed)
+	level := flate.BestSpeed
+	switch mode {
+	case compressHuffman:
+		level = flate.HuffmanOnly
+	case compressOff:
+		level = flate.NoCompression
+	}
+	frame, err := deflate(records.Bytes(), level)
 	if err != nil {
 		return res, err
 	}
 	// Since Go 1.27 BestSpeed stores what it cannot match, such as base64
 	// images, which Huffman coding alone still shrinks by a quarter.
-	if len(frame)*10 > records.Len()*9 {
+	if mode == compressAuto && len(frame)*10 > records.Len()*9 {
 		frame = nil
 		if frame, err = deflate(records.Bytes(), flate.HuffmanOnly); err != nil {
 			return res, err
