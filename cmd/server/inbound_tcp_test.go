@@ -112,7 +112,7 @@ func TestPlainTCPProbeFallsBack(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	server := NewMyServer(&tls.Config{}, fallbackListener.Addr().String())
+	server := NewMyServer(&tls.Config{}, fallbackListener.Addr().String(), "")
 	go handleTcpConnection(ctx, serverConn, server)
 
 	_ = clientConn.SetDeadline(time.Now().Add(5 * time.Second))

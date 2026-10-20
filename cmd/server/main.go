@@ -23,6 +23,7 @@ type serverConfig struct {
 	password      string
 	paddingScheme string
 	fallbackAddr  string
+	dedupBackend  string
 }
 
 func envOrDefault(key, fallback string) string {
@@ -60,6 +61,7 @@ func parseServerConfig(args []string) (serverConfig, error) {
 	passwordFile := flags.String("password-file", os.Getenv("ANYTLS_PASSWORD_FILE"), "file containing the password")
 	paddingScheme := flags.String("padding-scheme", os.Getenv("ANYTLS_PADDING_SCHEME"), "padding-scheme")
 	fallbackAddr := flags.String("fallback", envOrDefault("ANYTLS_FALLBACK", "127.0.0.1:80"), "fallback address for invalid connections")
+	dedupBackend := flags.String("dedup-backend", os.Getenv("ANYTLS_DEDUP_BACKEND"), "local decoder for "+dedupDestination+" streams, host:port or unix:/path")
 	if err := flags.Parse(args); err != nil {
 		return serverConfig{}, err
 	}
@@ -75,6 +77,7 @@ func parseServerConfig(args []string) (serverConfig, error) {
 		password:      resolvedPassword,
 		paddingScheme: *paddingScheme,
 		fallbackAddr:  *fallbackAddr,
+		dedupBackend:  *dedupBackend,
 	}, nil
 }
 
@@ -109,6 +112,9 @@ func main() {
 	if config.fallbackAddr != "" {
 		logrus.Infoln("[Server] Fallback", config.fallbackAddr)
 	}
+	if config.dedupBackend != "" {
+		logrus.Infoln("[Server] Dedup backend", config.dedupBackend)
+	}
 
 	listener, err := net.Listen("tcp", config.listen)
 	if err != nil {
@@ -124,7 +130,7 @@ func main() {
 	}
 
 	ctx := context.Background()
-	server := NewMyServer(tlsConfig, config.fallbackAddr)
+	server := NewMyServer(tlsConfig, config.fallbackAddr, config.dedupBackend)
 
 	for {
 		c, err := listener.Accept()

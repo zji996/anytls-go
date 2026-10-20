@@ -206,6 +206,8 @@ Stream 在代理中继完毕被关闭时，如果对应 Session 的事件循环�
 
 对于目标地址为 `sp.v2.udp-over-tcp.arpa` 的请求，则应该使用 sing-box udp-over-tcp 协议处理。
 
+对于目标地址为 `dedup.anytls.arpa` 的请求（本仓库扩展，任意端口），服务器把 Stream 转给本机去重解码端（`-dedup-backend`，`host:port` 或 `unix:/路径`）；没有配置时直接拒绝，不解析这个域名。客户端据此探测出口是否支持请求去重，不支持的服务器只会让探测失败，不影响其他流量。
+
 ## 协议参数
 
 anytls 协议参数不包括 TLS 的参数。应该在另外的配置分区中指定 TLS 参数。

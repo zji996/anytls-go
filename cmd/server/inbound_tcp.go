@@ -76,9 +76,12 @@ func handleTcpConnection(ctx context.Context, c net.Conn, s *myServer) {
 			return
 		}
 
-		if strings.Contains(destination.String(), "udp-over-tcp.arpa") {
+		switch {
+		case strings.EqualFold(destination.Fqdn, dedupDestination):
+			proxyOutboundDedup(ctx, stream, s.dedupBackend)
+		case strings.Contains(destination.String(), "udp-over-tcp.arpa"):
 			proxyOutboundUoT(ctx, stream, destination)
-		} else {
+		default:
 			proxyOutboundTCP(ctx, stream, destination)
 		}
 	}, &padding.DefaultPaddingFactory)
