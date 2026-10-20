@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -19,10 +20,11 @@ import (
 
 // tlsOrigin is an HTTPS origin for example.com that records what it receives.
 type tlsOrigin struct {
-	srv    *httptest.Server
-	mu     sync.Mutex
-	bodies [][]byte
-	protos []string
+	srv       *httptest.Server
+	mu        sync.Mutex
+	bodies    [][]byte
+	protos    []string
+	encodings []string
 }
 
 func newTLSOrigin(t *testing.T) *tlsOrigin {
@@ -32,7 +34,15 @@ func newTLSOrigin(t *testing.T) *tlsOrigin {
 		o.mu.Lock()
 		o.bodies = append(o.bodies, body)
 		o.protos = append(o.protos, r.Proto)
+		o.encodings = append(o.encodings, r.Header.Get("Accept-Encoding"))
 		o.mu.Unlock()
+		if r.URL.Path == "/gz" && r.Header.Get("Accept-Encoding") == "gzip" {
+			w.Header().Set("Content-Encoding", "gzip")
+			zw := gzip.NewWriter(w)
+			fmt.Fprint(zw, "compressed hello")
+			zw.Close()
+			return
+		}
 		fmt.Fprintf(w, "ok %d", len(body))
 	}))
 	o.srv.EnableHTTP2 = true
@@ -208,6 +218,24 @@ func TestFrontSendsToOriginWhenDecoderDies(t *testing.T) {
 		t.Fatalf("want one fallback and framing paused: %v", s)
 	}
 	c.post(t, c.client, conversation(2, images))
+}
+
+func TestGoGzipHeaderReachesOriginAndResponseDecodes(t *testing.T) {
+	c := newFrontChain(t, true)
+	resp, err := c.client.Get("https://example.com/gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(got) != "compressed hello" {
+		t.Fatalf("client got %q", got)
+	}
+	c.origin.mu.Lock()
+	defer c.origin.mu.Unlock()
+	if ae := c.origin.encodings[len(c.origin.encodings)-1]; ae != "gzip" {
+		t.Fatalf("origin saw Accept-Encoding %q, want gzip", ae)
+	}
 }
 
 func TestCARefusesNamesOutsideItsConstraints(t *testing.T) {

@@ -65,11 +65,13 @@ func newProxy(up route) *httputil.ReverseProxy {
 			return dialer.DialContext(ctx, network, addr)
 		}
 	}
+	var rt http.RoundTripper = transport
 	if up.url == nil {
 		// Like Sub2API's OpenAI transport: HTTP/2 with ping health checks.
 		transport.ForceAttemptHTTP2 = true
 		transport.TLSClientConfig = up.tls
 		transport.HTTP2 = &http.HTTP2Config{SendPingTimeout: 15 * time.Second, PingTimeout: 15 * time.Second}
+		rt = gzipLast(transport)
 	}
 	return &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -92,10 +94,28 @@ func newProxy(up route) *httputil.ReverseProxy {
 				}
 			}
 		},
-		Transport:     transport,
+		Transport:     rt,
 		FlushInterval: -1,
 		ErrorLog:      log.Default(),
 	}
+}
+
+// gzipLast sends a request carrying Go's own "Accept-Encoding: gzip" through
+// a transport that adds the header itself, because Go writes it after every
+// other header and an origin can see the order. That transport also
+// decompresses the response, which the client then gets as identity.
+func gzipLast(plain *http.Transport) http.RoundTripper {
+	compress := plain.Clone()
+	compress.DisableCompression = false
+	return roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if ae := req.Header["Accept-Encoding"]; len(ae) == 1 && ae[0] == "gzip" &&
+			req.Method != http.MethodHead && req.Header.Get("Range") == "" {
+			req = req.Clone(req.Context())
+			req.Header.Del("Accept-Encoding")
+			return compress.RoundTrip(req)
+		}
+		return plain.RoundTrip(req)
+	})
 }
 
 type counters struct {
