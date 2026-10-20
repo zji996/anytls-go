@@ -29,7 +29,9 @@ type encodeResult struct {
 // encodeFrame replaces chunks the peer is believed to hold with references.
 func encodeFrame(body []byte, known *lru) (encodeResult, error) {
 	var res encodeResult
-	var records bytes.Buffer
+	// Sized once: like readBody, growing multi-MiB buffers stalls small routers.
+	// A record is at most a varint longer than its chunk.
+	records := bytes.NewBuffer(make([]byte, 0, len(body)+(len(body)/minChunk+2)*(1+binary.MaxVarintLen64)))
 	var tmp [binary.MaxVarintLen64]byte
 	for _, piece := range chunks(body) {
 		sum := sha256.Sum256(piece)
@@ -56,8 +58,9 @@ func encodeFrame(body []byte, known *lru) (encodeResult, error) {
 	// Since Go 1.27 BestSpeed stores what it cannot match, such as base64
 	// images, which Huffman coding alone still shrinks by a quarter.
 	if len(frame)*10 > records.Len()*9 {
-		if alt, err := deflate(records.Bytes(), flate.HuffmanOnly); err == nil && len(alt) < len(frame) {
-			frame = alt
+		frame = nil
+		if frame, err = deflate(records.Bytes(), flate.HuffmanOnly); err != nil {
+			return res, err
 		}
 	}
 	res.frame = frame
@@ -65,10 +68,10 @@ func encodeFrame(body []byte, known *lru) (encodeResult, error) {
 }
 
 func deflate(records []byte, level int) ([]byte, error) {
-	var buf bytes.Buffer
-	buf.Grow(len(frameMagic) + len(records)/2)
+	// Room for stored blocks, deflate's worst case.
+	buf := bytes.NewBuffer(make([]byte, 0, len(frameMagic)+len(records)+len(records)/64+64))
 	buf.WriteString(frameMagic)
-	zw, err := flate.NewWriter(&buf, level)
+	zw, err := flate.NewWriter(buf, level)
 	if err != nil {
 		return nil, err
 	}

@@ -5,6 +5,18 @@ import (
 	"testing"
 )
 
+// BenchmarkEncodeNewContent frames 4 MiB nobody has seen, the slow case on
+// small routers.
+func BenchmarkEncodeNewContent(b *testing.B) {
+	body := []byte(image(3 << 20))
+	b.SetBytes(int64(len(body)))
+	for b.Loop() {
+		if _, err := encodeFrame(body, newLRU(64<<20)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestFrameShrinksNewBase64(t *testing.T) {
 	body := []byte(image(400 << 10))
 	res, err := encodeFrame(body, newLRU(64<<20))
