@@ -93,6 +93,7 @@ func runFront(args []string) {
 	compressFlag := fs.String("compress", "auto", "CPU for content the decoder lacks: auto, huffman (cheaper) or off (cache only)")
 	probe := fs.Duration("probe-interval", 5*time.Second, "decoder health check interval")
 	drain := fs.Duration("drain", 30*time.Second, "on SIGTERM, time for open requests to finish; a successor may already listen")
+	linger := fs.Duration("linger", 0, "on SIGTERM, keep accepting this long first, for a successor started at the same time to bind")
 	fs.Parse(args)
 	if *via == "" || *caDir == "" {
 		log.Fatal("-via and -ca-dir are required")
@@ -163,6 +164,7 @@ func runFront(args []string) {
 		}
 	}()
 	untilSignal(*drain, func(ctx context.Context) {
+		time.Sleep(*linger)
 		ln.Close()
 		f.shutdown(ctx)
 	})
