@@ -13,6 +13,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -153,6 +154,14 @@ type framedRequest struct {
 	body []byte
 	refs []digest
 	lits []digest
+	held *share
+}
+
+// done drops the body once a response or a final error is in: nothing will
+// be resent after that.
+func (f *framedRequest) done() {
+	f.body = nil
+	f.held.free()
 }
 
 func newEncoder(upstream route, indexBytes, maxBody int64) *encoder {
@@ -247,8 +256,7 @@ func (e *encoder) eligible(r *http.Request) bool {
 		r.Header.Get("Content-Encoding") == "" && r.Header.Get("Upgrade") == ""
 }
 
-// budget bounds the bytes held by requests being framed or rebuilt. Bodies
-// are held until their response ends, so streamed answers keep their share.
+// budget bounds the bytes held by requests being framed or rebuilt.
 type budget struct {
 	limit int64 // 0 is no limit
 	used  atomic.Int64
@@ -275,6 +283,69 @@ func (b *budget) release(n int64) {
 	}
 }
 
+// take reserves n bytes as a share, or returns nil when over the limit.
+func (b *budget) take(n int64) *share {
+	if !b.reserve(n) {
+		return nil
+	}
+	return &share{b: b, n: n}
+}
+
+// share is one request's part of a budget. It shrinks as its buffers become
+// garbage; free may be called any number of times.
+type share struct {
+	mu sync.Mutex
+	b  *budget
+	n  int64
+}
+
+func (s *share) shrink(to int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if to < s.n {
+		s.b.release(s.n - to)
+		s.n = to
+	}
+}
+
+func (s *share) free() { s.shrink(0) }
+
+// releasingBody serves b once and drops it, calling done, when the transport
+// has read it to the end or closed it. A streamed answer can last minutes;
+// the request body is not needed for any of it.
+type releasingBody struct {
+	mu   sync.Mutex
+	b    []byte
+	done func()
+}
+
+func (r *releasingBody) Read(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.b) == 0 {
+		r.dropLocked()
+		return 0, io.EOF
+	}
+	n := copy(p, r.b)
+	r.b = r.b[n:]
+	return n, nil
+}
+
+func (r *releasingBody) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.dropLocked()
+	return nil
+}
+
+func (r *releasingBody) dropLocked() {
+	r.b = nil
+	if r.done != nil {
+		r.done()
+		r.done = nil
+	}
+}
+
 func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !e.eligible(r) {
 		e.stats.plain.Add(1)
@@ -282,14 +353,14 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The body, its uncompressed records and a frame, each about as large.
-	held := 3*r.ContentLength + requestOverhead
-	if !e.inflight.reserve(held) {
+	held := e.inflight.take(3*r.ContentLength + requestOverhead)
+	if held == nil {
 		e.stats.busy.Add(1)
 		e.stats.plain.Add(1)
 		e.proxy.ServeHTTP(w, r)
 		return
 	}
-	defer func() { e.inflight.release(held) }()
+	defer held.free()
 	body, err := readBody(r.Body, r.ContentLength)
 	if err != nil {
 		http.Error(w, "request body read failed", http.StatusBadRequest)
@@ -304,15 +375,14 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Only the body, kept for resends, and the frame are still referenced.
-	keep := int64(len(body) + len(res.frame))
-	e.inflight.release(held - keep)
-	held = keep
+	held.shrink(int64(len(body) + len(res.frame)))
 	e.stats.framed.Add(1)
 	e.stats.original.Add(int64(len(body)))
 	e.stats.sent.Add(int64(len(res.frame)))
 	e.stats.refBytes.Add(int64(res.refBytes))
-	r = r.WithContext(context.WithValue(r.Context(), frameCtxKey{}, &framedRequest{body: body, refs: res.refHashes, lits: res.litHashes}))
-	r.Body = io.NopCloser(bytes.NewReader(res.frame))
+	framed := &framedRequest{body: body, refs: res.refHashes, lits: res.litHashes, held: held}
+	r = r.WithContext(context.WithValue(r.Context(), frameCtxKey{}, framed))
+	r.Body = &releasingBody{b: res.frame}
 	r.ContentLength = int64(len(res.frame))
 	r.Header.Set(hdrFrame, "1")
 	r.Header.Set(hdrLen, strconv.Itoa(len(body)))
@@ -322,6 +392,14 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (e *encoder) roundTrip(base http.RoundTripper, req *http.Request) (*http.Response, error) {
 	framed, _ := req.Context().Value(frameCtxKey{}).(*framedRequest)
+	resp, err := e.send(base, req, framed)
+	if framed != nil {
+		framed.done()
+	}
+	return resp, err
+}
+
+func (e *encoder) send(base http.RoundTripper, req *http.Request, framed *framedRequest) (*http.Response, error) {
 	resp, err := base.RoundTrip(req)
 	if err != nil {
 		e.pause("decoder request", err)
@@ -389,7 +467,7 @@ func (e *encoder) misdelivered(base http.RoundTripper, req *http.Request, framed
 
 func plainCopy(req *http.Request, framed *framedRequest) *http.Request {
 	plain := req.Clone(req.Context())
-	plain.Body = io.NopCloser(bytes.NewReader(framed.body))
+	plain.Body = &releasingBody{b: framed.body}
 	plain.ContentLength = int64(len(framed.body))
 	plain.GetBody = nil
 	for _, h := range []string{hdrFrame, hdrLen, hdrEpoch} {
@@ -487,8 +565,8 @@ func (d *decoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.reject(w, r, "bad dedup frame length", nil)
 		return
 	}
-	held := r.ContentLength + int64(want) + requestOverhead
-	if !d.inflight.reserve(held) {
+	held := d.inflight.take(r.ContentLength + int64(want) + requestOverhead)
+	if held == nil {
 		// Missing nothing: the encoder resends the original, which streams
 		// through unbuffered. Draining keeps the connection usable.
 		d.stats.busy.Add(1)
@@ -497,7 +575,7 @@ func (d *decoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusConflict)
 		return
 	}
-	defer func() { d.inflight.release(held) }()
+	defer held.free()
 	frame, err := readBody(r.Body, r.ContentLength)
 	if err != nil {
 		d.reject(w, r, "dedup frame read failed", err)
@@ -508,9 +586,8 @@ func (d *decoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.reject(w, r, "bad dedup frame", err)
 		return
 	}
-	// The rebuilt body is held until the origin has answered; the frame is not.
-	d.inflight.release(held - int64(want))
-	held = int64(want)
+	// The frame is garbage; the rebuilt body is held until sent upstream.
+	held.shrink(int64(want))
 	if len(missing) > 0 {
 		d.misses.Add(int64(len(missing)))
 		w.Header().Set(hdrMissing, strconv.Itoa(len(missing)))
@@ -526,7 +603,7 @@ func (d *decoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	d.stats.framed.Add(1)
 	d.stats.original.Add(int64(len(body)))
 	d.stats.sent.Add(int64(len(frame)))
-	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.Body = &releasingBody{b: body, done: held.free}
 	r.ContentLength = int64(len(body))
 	for _, h := range []string{hdrFrame, hdrLen, hdrEpoch} {
 		r.Header.Del(h)

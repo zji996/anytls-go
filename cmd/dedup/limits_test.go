@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"runtime"
 	"testing"
@@ -93,6 +97,30 @@ func TestBudgetsReturnToZero(t *testing.T) {
 	if c.enc.inflight.used.Load() != 0 || c.dec.inflight.used.Load() != 0 {
 		t.Fatalf("budgets leaked: encoder %d, decoder %d", c.enc.inflight.used.Load(), c.dec.inflight.used.Load())
 	}
+}
+
+func TestStreamedAnswerHoldsNoBudget(t *testing.T) {
+	c := newChain(t, 64<<20)
+	c.enc.inflight.limit = 32 << 20
+	c.dec.inflight.limit = 32 << 20
+	body := conversation(2, []string{image(300 << 10), image(300 << 10)})
+	resp, err := http.Post(c.encSrv.URL+"/stream", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	r := bufio.NewReader(resp.Body)
+	if line, _ := r.ReadString('\n'); line != "data: first\n" {
+		t.Fatalf("first event %q", line)
+	}
+	// The origin is still streaming; neither end needs the body any more.
+	if e, d := c.enc.inflight.used.Load(), c.dec.inflight.used.Load(); e != 0 || d != 0 {
+		t.Fatalf("mid-stream budgets: encoder %d, decoder %d", e, d)
+	}
+	if c.enc.snapshot()["framed"].(int64) != 1 || !bytes.Equal(c.origin.last(), body) {
+		t.Fatal("request was not framed and rebuilt intact")
+	}
+	io.Copy(io.Discard, r)
 }
 
 func TestFrontRefusesConnectionsOverLimit(t *testing.T) {
