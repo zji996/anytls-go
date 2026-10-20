@@ -1,0 +1,121 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"compress/flate"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+)
+
+// Frame: "EDG1" + deflate stream of records, then 'E'.
+//
+//	'L' uvarint(len) bytes   literal chunk; the decoder caches it
+//	'R' 32-byte sha256       chunk the decoder already holds
+const frameMagic = "EDG1"
+
+type encodeResult struct {
+	frame     []byte
+	refBytes  int
+	litBytes  int
+	refs      int
+	literals  int
+	refHashes []digest
+}
+
+// encodeFrame replaces chunks the peer is believed to hold with references.
+func encodeFrame(body []byte, known *lru) (encodeResult, error) {
+	var res encodeResult
+	var buf bytes.Buffer
+	buf.WriteString(frameMagic)
+	zw, err := flate.NewWriter(&buf, flate.BestSpeed) // base64 gains nothing from higher levels
+	if err != nil {
+		return res, err
+	}
+	var tmp [binary.MaxVarintLen64]byte
+	for _, piece := range chunks(body) {
+		sum := sha256.Sum256(piece)
+		if _, ok := known.get(sum); ok {
+			zw.Write([]byte{'R'})
+			zw.Write(sum[:])
+			res.refs++
+			res.refBytes += len(piece)
+			res.refHashes = append(res.refHashes, sum)
+			continue
+		}
+		known.put(sum, len(piece), nil)
+		zw.Write([]byte{'L'})
+		zw.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(piece)))])
+		zw.Write(piece)
+		res.literals++
+		res.litBytes += len(piece)
+	}
+	zw.Write([]byte{'E'})
+	if err := zw.Close(); err != nil {
+		return res, err
+	}
+	res.frame = buf.Bytes()
+	return res, nil
+}
+
+var errFrame = errors.New("malformed dedup frame")
+
+// decodeFrame rebuilds the body. Literals are cached even when some
+// references are missing, so a plain resend is the only cost of a miss.
+func decodeFrame(frame []byte, want int, cache *lru) (body []byte, missing []digest, err error) {
+	if !bytes.HasPrefix(frame, []byte(frameMagic)) {
+		return nil, nil, errFrame
+	}
+	r := bufio.NewReader(flate.NewReader(bytes.NewReader(frame[len(frameMagic):])))
+	out := make([]byte, 0, want)
+	for {
+		tag, err := r.ReadByte()
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: %v", errFrame, err)
+		}
+		switch tag {
+		case 'E':
+			if len(missing) == 0 && len(out) != want {
+				return nil, nil, fmt.Errorf("%w: length %d, want %d", errFrame, len(out), want)
+			}
+			return out, missing, nil
+		case 'L':
+			n, err := binary.ReadUvarint(r)
+			if err != nil || n == 0 || n > maxChunk {
+				return nil, nil, fmt.Errorf("%w: literal length", errFrame)
+			}
+			piece := make([]byte, n)
+			if _, err := io.ReadFull(r, piece); err != nil {
+				return nil, nil, fmt.Errorf("%w: literal body", errFrame)
+			}
+			cache.put(sha256.Sum256(piece), len(piece), piece)
+			if len(missing) == 0 {
+				if len(out)+len(piece) > want {
+					return nil, nil, fmt.Errorf("%w: overrun", errFrame)
+				}
+				out = append(out, piece...)
+			}
+		case 'R':
+			var sum digest
+			if _, err := io.ReadFull(r, sum[:]); err != nil {
+				return nil, nil, fmt.Errorf("%w: reference", errFrame)
+			}
+			piece, ok := cache.get(sum)
+			if !ok {
+				missing = append(missing, sum)
+				continue
+			}
+			if len(missing) == 0 {
+				if len(out)+len(piece) > want {
+					return nil, nil, fmt.Errorf("%w: overrun", errFrame)
+				}
+				out = append(out, piece...)
+			}
+		default:
+			return nil, nil, fmt.Errorf("%w: tag %q", errFrame, tag)
+		}
+	}
+}

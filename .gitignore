@@ -1,6 +1,7 @@
 /dist
 /cmd/client/client
 /cmd/server/server
+/cmd/dedup/dedup
 
 # Local build outputs
 /anytls-client
