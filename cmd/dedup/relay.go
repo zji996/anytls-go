@@ -271,8 +271,8 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		e.proxy.ServeHTTP(w, r)
 		return
 	}
-	// The body plus a frame of at most about the same size.
-	need := 2 * r.ContentLength
+	// The body, its uncompressed records and a frame, each about as large.
+	need := 3 * r.ContentLength
 	if !e.reserve(need) {
 		e.stats.busy.Add(1)
 		e.stats.plain.Add(1)

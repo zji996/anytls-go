@@ -29,36 +29,54 @@ type encodeResult struct {
 // encodeFrame replaces chunks the peer is believed to hold with references.
 func encodeFrame(body []byte, known *lru) (encodeResult, error) {
 	var res encodeResult
-	var buf bytes.Buffer
-	buf.WriteString(frameMagic)
-	zw, err := flate.NewWriter(&buf, flate.BestSpeed) // base64 gains nothing from higher levels
-	if err != nil {
-		return res, err
-	}
+	var records bytes.Buffer
 	var tmp [binary.MaxVarintLen64]byte
 	for _, piece := range chunks(body) {
 		sum := sha256.Sum256(piece)
 		if _, ok := known.get(sum); ok {
-			zw.Write([]byte{'R'})
-			zw.Write(sum[:])
+			records.WriteByte('R')
+			records.Write(sum[:])
 			res.refs++
 			res.refBytes += len(piece)
 			res.refHashes = append(res.refHashes, sum)
 			continue
 		}
 		known.put(sum, len(piece), nil)
-		zw.Write([]byte{'L'})
-		zw.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(piece)))])
-		zw.Write(piece)
+		records.WriteByte('L')
+		records.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(piece)))])
+		records.Write(piece)
 		res.literals++
 		res.litBytes += len(piece)
 	}
-	zw.Write([]byte{'E'})
-	if err := zw.Close(); err != nil {
+	records.WriteByte('E')
+	frame, err := deflate(records.Bytes(), flate.BestSpeed)
+	if err != nil {
 		return res, err
 	}
-	res.frame = buf.Bytes()
+	// Since Go 1.27 BestSpeed stores what it cannot match, such as base64
+	// images, which Huffman coding alone still shrinks by a quarter.
+	if len(frame)*10 > records.Len()*9 {
+		if alt, err := deflate(records.Bytes(), flate.HuffmanOnly); err == nil && len(alt) < len(frame) {
+			frame = alt
+		}
+	}
+	res.frame = frame
 	return res, nil
+}
+
+func deflate(records []byte, level int) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.Grow(len(frameMagic) + len(records)/2)
+	buf.WriteString(frameMagic)
+	zw, err := flate.NewWriter(&buf, level)
+	if err != nil {
+		return nil, err
+	}
+	zw.Write(records)
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 var errFrame = errors.New("malformed dedup frame")
