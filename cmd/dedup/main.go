@@ -78,13 +78,13 @@ func runCA(args []string) {
 
 func runFront(args []string) {
 	fs := flag.NewFlagSet("front", flag.ExitOnError)
-	listen := fs.String("listen", "127.0.0.1:10860", "SOCKS5/HTTP proxy listen address")
-	via := fs.String("via", "", "SOCKS5 proxy toward the exit, e.g. socks5://127.0.0.1:10808")
+	listen := fs.String("listen", "127.0.0.1:10860", "SOCKS5/HTTP proxy listen address; a SOCKS5 username and password pick the exit, see -via")
+	via := fs.String("via", "", "SOCKS5 proxy toward the exit, e.g. socks5://127.0.0.1:10808; dialed with the client's SOCKS5 username and password when it sent them")
 	decoder := fs.String("decoder", "http://"+dedupHost, "decoder URL, reached through -via")
 	domains := fs.String("domains", "", "comma-separated domains whose TLS is intercepted")
 	caDir := fs.String("ca-dir", "", "directory with ca.pem and ca.key")
 	admin := fs.String("admin", "", "loopback address for GET /stats")
-	indexMiB := fs.Int64("index-mib", 230, "content indexed as held by the decoder; keep at about 90% of its -cache-mib; costs up to an eighth of it")
+	indexMiB := fs.Int64("index-mib", 230, "content indexed as held by each exit's decoder; keep at about 90% of its -cache-mib; costs up to an eighth of it")
 	maxBodyMiB := fs.Int64("max-body-mib", 64, "largest body that is deduplicated; larger ones pass through")
 	inflightMiB := fs.Int64("inflight-mib", 128, "memory for requests being deduplicated, 3x body + 2 MiB each; others pass through")
 	maxConns := fs.Int("max-conns", 256, "open proxy connections; more are refused (0 = no limit)")
@@ -125,32 +125,16 @@ func runFront(args []string) {
 		log.Fatal(err)
 	}
 
-	var user, pass string
-	if viaURL.User != nil {
-		user = viaURL.User.Username()
-		pass, _ = viaURL.User.Password()
-	}
-	socksClient := socks.NewClient(N.SystemDialer, M.ParseSocksaddr(viaURL.Host), socks.Version5, user, pass)
-	dial := func(ctx context.Context, dest M.Socksaddr) (net.Conn, error) {
-		return socksClient.DialContext(ctx, N.NetworkTCP, dest)
-	}
-
-	enc := newEncoder(route{url: decURL, via: viaURL}, *indexMiB<<20, *maxBodyMiB<<20)
-	enc.inflight.limit = *inflightMiB << 20
-	if enc.compress, err = parseCompression(*compressFlag); err != nil {
+	mode, err := parseCompression(*compressFlag)
+	if err != nil {
 		log.Fatal(err)
 	}
-	direct := newProxy(route{via: viaURL})
-	enc.origin = direct.Transport
-	f := newFront(list, ca, dial, enc, direct)
+	lc := laneConfig{
+		via: viaURL, decoder: decURL, indexBytes: *indexMiB << 20, maxBody: *maxBodyMiB << 20,
+		inflight: &budget{limit: *inflightMiB << 20}, compress: mode, probe: *probe,
+	}
+	f := newFront(list, ca, newLaneSet(maxLanes, lc.newLane))
 	f.maxConns = *maxConns
-
-	go func() {
-		for {
-			enc.probe(context.Background(), decURL)
-			time.Sleep(*probe)
-		}
-	}()
 	serveAdmin(*admin, f.snapshot)
 
 	ln, err := bind(*listen)
@@ -168,6 +152,57 @@ func runFront(args []string) {
 		ln.Close()
 		f.shutdown(ctx)
 	})
+}
+
+// maxLanes bounds the exits one front keeps an encoder and index for.
+const maxLanes = 32
+
+type laneConfig struct {
+	via, decoder        *url.URL
+	indexBytes, maxBody int64
+	inflight            *budget
+	compress            compression
+	probe               time.Duration
+}
+
+// newLane makes a lane that reaches -via with the client's SOCKS5 username and
+// password, or with -via's own when the client sent none.
+func (c laneConfig) newLane(user, pass string) *lane {
+	via := *c.via
+	if user != "" || pass != "" {
+		via.User = url.UserPassword(user, pass)
+	}
+	var viaUser, viaPass string
+	if via.User != nil {
+		viaUser = via.User.Username()
+		viaPass, _ = via.User.Password()
+	}
+	socksClient := socks.NewClient(N.SystemDialer, M.ParseSocksaddr(via.Host), socks.Version5, viaUser, viaPass)
+	enc := newEncoder(route{url: c.decoder, via: &via}, c.indexBytes, c.maxBody)
+	enc.inflight = c.inflight
+	enc.compress = c.compress
+	direct := newProxy(route{via: &via})
+	enc.origin = direct.Transport
+	log.Printf("lane %q via %s", user, via.Host)
+	go probeLoop(enc, c.decoder, c.probe)
+	return &lane{name: user, enc: enc, direct: direct, dial: func(ctx context.Context, dest M.Socksaddr) (net.Conn, error) {
+		return socksClient.DialContext(ctx, N.NetworkTCP, dest)
+	}}
+}
+
+// probeLoop checks the decoder every interval while it answers, and backs off
+// to a minute while it does not: most exits of a router may have none.
+func probeLoop(enc *encoder, decoder *url.URL, interval time.Duration) {
+	wait := interval
+	for {
+		enc.probe(context.Background(), decoder)
+		if enc.healthy() {
+			wait = interval
+		} else {
+			wait = min(2*wait, max(interval, time.Minute))
+		}
+		time.Sleep(wait)
+	}
 }
 
 func runBack(args []string) {

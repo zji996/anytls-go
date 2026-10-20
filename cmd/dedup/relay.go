@@ -137,7 +137,8 @@ type encoder struct {
 	base      http.RoundTripper
 	stats     counters
 
-	inflight budget
+	// inflight may be shared by the encoders of several exits.
+	inflight *budget
 	// origin, if set, sends a framed request straight to its origin when the
 	// decoder cannot be reached.
 	origin   http.RoundTripper
@@ -165,7 +166,7 @@ func (f *framedRequest) done() {
 }
 
 func newEncoder(upstream route, indexBytes, maxBody int64) *encoder {
-	e := &encoder{known: newLRU(indexBytes), maxBody: maxBody}
+	e := &encoder{known: newLRU(indexBytes), maxBody: maxBody, inflight: &budget{}}
 	e.epoch.Store("")
 	e.lastEpoch.Store("")
 	e.proxy = newProxy(upstream)
