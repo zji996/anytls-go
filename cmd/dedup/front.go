@@ -40,7 +40,9 @@ type front struct {
 	conns     *connListener
 	closed    sync.Map // *tls.Conn -> chan struct{}
 
-	intercepted, passed atomic.Int64
+	// maxConns bounds open proxy connections; 0 is no limit.
+	maxConns                     int
+	intercepted, passed, refused atomic.Int64
 }
 
 const peekTimeout = 10 * time.Second
@@ -67,12 +69,31 @@ func newFront(domains domainList, ca *authority, dial func(context.Context, M.So
 
 // serve accepts proxy clients until ln fails.
 func (f *front) serve(ln net.Listener) error {
+	var slots chan struct{}
+	if f.maxConns > 0 {
+		slots = make(chan struct{}, f.maxConns)
+	}
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		go f.handle(c)
+		if slots == nil {
+			go f.handle(c)
+			continue
+		}
+		select {
+		case slots <- struct{}{}:
+			go func() {
+				defer func() { <-slots }()
+				f.handle(c)
+			}()
+		default:
+			if n := f.refused.Add(1); n&(n-1) == 0 {
+				log.Printf("%d connections open; refused %d so far, now %s", f.maxConns, n, c.RemoteAddr())
+			}
+			c.Close()
+		}
 	}
 }
 
@@ -163,6 +184,7 @@ func (f *front) snapshot() map[string]any {
 	s["role"] = "front"
 	s["intercepted_conns"] = f.intercepted.Load()
 	s["passed_conns"] = f.passed.Load()
+	s["refused_conns"] = f.refused.Load()
 	return s
 }
 

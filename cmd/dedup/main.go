@@ -83,15 +83,23 @@ func runFront(args []string) {
 	domains := fs.String("domains", "", "comma-separated domains whose TLS is intercepted")
 	caDir := fs.String("ca-dir", "", "directory with ca.pem and ca.key")
 	admin := fs.String("admin", "", "loopback address for GET /stats")
-	indexMiB := fs.Int64("index-mib", 512, "content indexed as held by the decoder; keep below its -cache-mib")
+	indexMiB := fs.Int64("index-mib", 512, "content indexed as held by the decoder; keep below its -cache-mib; costs up to an eighth of it")
 	maxBodyMiB := fs.Int64("max-body-mib", 64, "largest body that is deduplicated; larger ones pass through")
-	inflightMiB := fs.Int64("inflight-mib", 128, "memory for bodies being deduplicated; others pass through")
+	inflightMiB := fs.Int64("inflight-mib", 128, "memory for requests being deduplicated, 3x body + 2 MiB each; others pass through")
+	maxConns := fs.Int("max-conns", 256, "open proxy connections; more are refused (0 = no limit)")
+	memoryMiB := fs.Int64("memory-mib", 0, "Go soft memory limit (0 = index/8 + inflight + 64; GOMEMLIMIT overrides)")
+	oomScore := fs.Int("oom-score-adj", 500, "raise oom_score_adj to this so the kernel kills the front before the proxy (0 = leave)")
 	compressFlag := fs.String("compress", "auto", "CPU for content the decoder lacks: auto, huffman (cheaper) or off (cache only)")
 	probe := fs.Duration("probe-interval", 15*time.Second, "decoder health check interval")
 	fs.Parse(args)
 	if *via == "" || *caDir == "" {
 		log.Fatal("-via and -ca-dir are required")
 	}
+	if *memoryMiB == 0 {
+		*memoryMiB = *indexMiB/8 + *inflightMiB + 64
+	}
+	setMemoryLimit(*memoryMiB)
+	preferOOMKill(*oomScore)
 	// On an otherwise idle 4-core Cortex-A53 router, GC mark workers on idle
 	// Ps doubled the front's CPU with no gain in latency.
 	if os.Getenv("GOMAXPROCS") == "" {
@@ -125,13 +133,14 @@ func runFront(args []string) {
 	}
 
 	enc := newEncoder(route{url: decURL, via: viaURL}, *indexMiB<<20, *maxBodyMiB<<20)
-	enc.maxInflight = *inflightMiB << 20
+	enc.inflight.limit = *inflightMiB << 20
 	if enc.compress, err = parseCompression(*compressFlag); err != nil {
 		log.Fatal(err)
 	}
 	direct := newProxy(route{via: viaURL})
 	enc.origin = direct.Transport
 	f := newFront(list, ca, dial, enc, direct)
+	f.maxConns = *maxConns
 
 	go func() {
 		for {
@@ -154,14 +163,22 @@ func runBack(args []string) {
 	listen := fs.String("listen", "", "listen address, host:port or unix:/path")
 	domains := fs.String("domains", "", "comma-separated origins requests may name")
 	admin := fs.String("admin", "", "loopback address for GET /stats")
-	cacheMiB := fs.Int64("cache-mib", 512, "chunk cache size")
+	cacheMiB := fs.Int64("cache-mib", 512, "chunk bytes kept; they cost about 1.25x this")
 	maxBodyMiB := fs.Int64("max-body-mib", 64, "largest body that is deduplicated")
+	inflightMiB := fs.Int64("inflight-mib", 128, "memory for frames being rebuilt; past it the front resends originals, which stream")
+	memoryMiB := fs.Int64("memory-mib", 0, "Go soft memory limit (0 = cache*1.25 + inflight + 64; GOMEMLIMIT overrides)")
+	oomScore := fs.Int("oom-score-adj", 500, "raise oom_score_adj to this so the kernel kills the back before the anytls server (0 = leave)")
 	resolve := fs.String("resolve", "", "test only: comma-separated host:port=addr:port origin overrides")
 	upstreamCA := fs.String("upstream-ca", "", "test only: extra PEM roots for origins")
 	fs.Parse(args)
 	if *listen == "" {
 		log.Fatal("-listen is required")
 	}
+	if *memoryMiB == 0 {
+		*memoryMiB = *cacheMiB*5/4 + *inflightMiB + 64
+	}
+	setMemoryLimit(*memoryMiB)
+	preferOOMKill(*oomScore)
 	up := route{}
 	if *resolve != "" {
 		up.resolve = map[string]string{}
@@ -188,6 +205,7 @@ func runBack(args []string) {
 		up.tls = &tls.Config{RootCAs: roots}
 	}
 	dec := newDecoder(up, *cacheMiB<<20, *maxBodyMiB<<20)
+	dec.inflight.limit = *inflightMiB << 20
 	dec.hosts = mustDomains(*domains)
 	serveAdmin(*admin, dec.snapshot)
 

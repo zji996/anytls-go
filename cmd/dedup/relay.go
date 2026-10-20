@@ -136,9 +136,7 @@ type encoder struct {
 	base      http.RoundTripper
 	stats     counters
 
-	// maxInflight bounds the bytes of buffered bodies and frames; 0 is no limit.
-	maxInflight int64
-	inflight    atomic.Int64
+	inflight budget
 	// origin, if set, sends a framed request straight to its origin when the
 	// decoder cannot be reached.
 	origin   http.RoundTripper
@@ -154,6 +152,7 @@ type frameCtxKey struct{}
 type framedRequest struct {
 	body []byte
 	refs []digest
+	lits []digest
 }
 
 func newEncoder(upstream route, indexBytes, maxBody int64) *encoder {
@@ -248,21 +247,31 @@ func (e *encoder) eligible(r *http.Request) bool {
 		r.Header.Get("Content-Encoding") == "" && r.Header.Get("Upgrade") == ""
 }
 
-// reserve claims n bytes of the in-flight budget.
-func (e *encoder) reserve(n int64) bool {
-	if e.maxInflight == 0 {
+// budget bounds the bytes held by requests being framed or rebuilt. Bodies
+// are held until their response ends, so streamed answers keep their share.
+type budget struct {
+	limit int64 // 0 is no limit
+	used  atomic.Int64
+}
+
+// requestOverhead is what a request holds besides its body and frame: flate
+// writers alone allocate 0.3-0.8 MiB each.
+const requestOverhead = 2 << 20
+
+func (b *budget) reserve(n int64) bool {
+	if b.limit == 0 {
 		return true
 	}
-	if e.inflight.Add(n) > e.maxInflight {
-		e.inflight.Add(-n)
+	if b.used.Add(n) > b.limit {
+		b.used.Add(-n)
 		return false
 	}
 	return true
 }
 
-func (e *encoder) release(n int64) {
-	if e.maxInflight != 0 {
-		e.inflight.Add(-n)
+func (b *budget) release(n int64) {
+	if b.limit != 0 {
+		b.used.Add(-n)
 	}
 }
 
@@ -273,14 +282,14 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The body, its uncompressed records and a frame, each about as large.
-	need := 3 * r.ContentLength
-	if !e.reserve(need) {
+	held := 3*r.ContentLength + requestOverhead
+	if !e.inflight.reserve(held) {
 		e.stats.busy.Add(1)
 		e.stats.plain.Add(1)
 		e.proxy.ServeHTTP(w, r)
 		return
 	}
-	defer e.release(need)
+	defer func() { e.inflight.release(held) }()
 	body, err := readBody(r.Body, r.ContentLength)
 	if err != nil {
 		http.Error(w, "request body read failed", http.StatusBadRequest)
@@ -294,11 +303,15 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		e.proxy.ServeHTTP(w, r)
 		return
 	}
+	// Only the body, kept for resends, and the frame are still referenced.
+	keep := int64(len(body) + len(res.frame))
+	e.inflight.release(held - keep)
+	held = keep
 	e.stats.framed.Add(1)
 	e.stats.original.Add(int64(len(body)))
 	e.stats.sent.Add(int64(len(res.frame)))
 	e.stats.refBytes.Add(int64(res.refBytes))
-	r = r.WithContext(context.WithValue(r.Context(), frameCtxKey{}, &framedRequest{body: body, refs: res.refHashes}))
+	r = r.WithContext(context.WithValue(r.Context(), frameCtxKey{}, &framedRequest{body: body, refs: res.refHashes, lits: res.litHashes}))
 	r.Body = io.NopCloser(bytes.NewReader(res.frame))
 	r.ContentLength = int64(len(res.frame))
 	r.Header.Set(hdrFrame, "1")
@@ -338,6 +351,11 @@ func (e *encoder) roundTrip(base http.RoundTripper, req *http.Request) (*http.Re
 	if resp.Header.Get(hdrReset) != "" {
 		e.known.reset()
 		e.stats.resets.Add(1)
+	} else if resp.Header.Get(hdrMissing) == "0" {
+		// A busy decoder drained the frame unread, literals included.
+		for _, d := range framed.lits {
+			e.known.remove(d)
+		}
 	} else {
 		for i := 0; i+len(digest{}) <= len(hashes); i += len(digest{}) {
 			var d digest
@@ -390,7 +408,7 @@ func (e *encoder) snapshot() map[string]any {
 	return map[string]any{
 		"role": "encode", "epoch": e.epoch.Load(), "framed": e.stats.framed.Load(), "plain": e.stats.plain.Load(),
 		"retries": e.stats.retries.Load(), "resets": e.stats.resets.Load(), "misdelivered": e.stats.misdelivered.Load(),
-		"fallbacks": e.stats.fallbacks.Load(), "busy": e.stats.busy.Load(), "inflight_bytes": e.inflight.Load(),
+		"fallbacks": e.stats.fallbacks.Load(), "busy": e.stats.busy.Load(), "inflight_bytes": e.inflight.used.Load(),
 		"original_bytes": orig, "sent_bytes": sent, "ref_bytes": e.stats.refBytes.Load(), "ratio": ratio,
 		"index_entries": entries, "index_bytes": used,
 	}
@@ -400,6 +418,7 @@ func (e *encoder) snapshot() map[string]any {
 
 type decoder struct {
 	cache    *lru
+	inflight budget
 	maxFrame int64
 	maxBody  int64
 	epoch    string
@@ -468,6 +487,17 @@ func (d *decoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.reject(w, r, "bad dedup frame length", nil)
 		return
 	}
+	held := r.ContentLength + int64(want) + requestOverhead
+	if !d.inflight.reserve(held) {
+		// Missing nothing: the encoder resends the original, which streams
+		// through unbuffered. Draining keeps the connection usable.
+		d.stats.busy.Add(1)
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set(hdrMissing, "0")
+		w.WriteHeader(http.StatusConflict)
+		return
+	}
+	defer func() { d.inflight.release(held) }()
 	frame, err := readBody(r.Body, r.ContentLength)
 	if err != nil {
 		d.reject(w, r, "dedup frame read failed", err)
@@ -478,6 +508,9 @@ func (d *decoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.reject(w, r, "bad dedup frame", err)
 		return
 	}
+	// The rebuilt body is held until the origin has answered; the frame is not.
+	d.inflight.release(held - int64(want))
+	held = int64(want)
 	if len(missing) > 0 {
 		d.misses.Add(int64(len(missing)))
 		w.Header().Set(hdrMissing, strconv.Itoa(len(missing)))
@@ -505,7 +538,8 @@ func (d *decoder) snapshot() map[string]any {
 	entries, used := d.cache.stats()
 	return map[string]any{
 		"role": "decode", "epoch": d.epoch, "framed": d.stats.framed.Load(), "plain": d.stats.plain.Load(),
-		"missing_refs": d.misses.Load(), "original_bytes": d.stats.original.Load(), "frame_bytes": d.stats.sent.Load(),
+		"missing_refs": d.misses.Load(), "busy": d.stats.busy.Load(), "inflight_bytes": d.inflight.used.Load(),
+		"original_bytes": d.stats.original.Load(), "frame_bytes": d.stats.sent.Load(),
 		"cache_entries": entries, "cache_bytes": used,
 	}
 }

@@ -24,6 +24,7 @@ type encodeResult struct {
 	refs      int
 	literals  int
 	refHashes []digest
+	litHashes []digest
 }
 
 // compression is how much CPU a frame's new content gets. References to
@@ -66,6 +67,7 @@ func encodeFrame(body []byte, known *lru, mode compression) (encodeResult, error
 			continue
 		}
 		known.put(sum, len(piece), nil)
+		res.litHashes = append(res.litHashes, sum)
 		records.WriteByte('L')
 		records.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(piece)))])
 		records.Write(piece)
