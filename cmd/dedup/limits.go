@@ -1,14 +1,50 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"io/fs"
 	"log"
+	"net"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 )
+
+// bind binds host:port, shareable with a successor instance on Linux, or
+// unix:/path. A unix socket is replaced, and not removed on close, so a
+// draining instance does not delete its successor's socket.
+func bind(address string) (net.Listener, error) {
+	path, ok := strings.CutPrefix(address, "unix:")
+	if !ok {
+		lc := net.ListenConfig{Control: reusePort}
+		return lc.Listen(context.Background(), "tcp", address)
+	}
+	os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	return ln, nil
+}
+
+// untilSignal blocks until SIGTERM or an interrupt, then runs drain with a
+// deadline, so in-flight requests, streamed answers included, can finish.
+func untilSignal(timeout time.Duration, drain func(context.Context)) {
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGTERM, os.Interrupt)
+	sig := <-stop
+	log.Printf("%v: draining for up to %v", sig, timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	drain(ctx)
+	log.Printf("drained")
+}
 
 // setMemoryLimit holds the heap near what the caches and budgets allow; with
 // only GOGC a full cache lets it grow to twice its live size. GOMEMLIMIT wins.

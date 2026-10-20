@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +43,7 @@ type front struct {
 
 	// maxConns bounds open proxy connections; 0 is no limit.
 	maxConns                     int
+	open                         sync.WaitGroup
 	intercepted, passed, refused atomic.Int64
 }
 
@@ -61,6 +63,12 @@ func newFront(domains domainList, ca *authority, dial func(context.Context, M.So
 		IdleTimeout:       5 * time.Minute,
 		ConnState:         f.connState,
 		ErrorLog:          log.Default(),
+		// Clients are on the LAN, where 256 KiB windows still run at hundreds
+		// of MB/s; the 1 MiB default would let each connection buffer 1 MiB.
+		HTTP2: &http.HTTP2Config{
+			MaxReceiveBufferPerConnection: 256 << 10,
+			MaxReceiveBufferPerStream:     256 << 10,
+		},
 	}
 	// Serve speaks HTTP/2 on *tls.Conn connections that negotiated h2.
 	go f.server.Serve(f.conns)
@@ -79,11 +87,13 @@ func (f *front) serve(ln net.Listener) error {
 			return err
 		}
 		if slots == nil {
+			f.open.Add(1)
 			go f.handle(c)
 			continue
 		}
 		select {
 		case slots <- struct{}{}:
+			f.open.Add(1)
 			go func() {
 				defer func() { <-slots }()
 				f.handle(c)
@@ -97,8 +107,30 @@ func (f *front) serve(ln net.Listener) error {
 	}
 }
 
+// shutdown stops serving intercepted connections once their requests end and
+// waits, until ctx is done, for those and the relayed ones to close.
+func (f *front) shutdown(ctx context.Context) {
+	f.server.Shutdown(ctx)
+	closed := make(chan struct{})
+	go func() {
+		f.open.Wait()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+	}
+}
+
 func (f *front) handle(c net.Conn) {
+	defer f.open.Done()
 	defer c.Close()
+	// One client's connection must not take the proxy down for all others.
+	defer func() {
+		if p := recover(); p != nil {
+			log.Printf("proxy client %s: panic: %v\n%s", c.RemoteAddr(), p, debug.Stack())
+		}
+	}()
 	reader := std_bufio.NewReader(c)
 	first, err := reader.Peek(1)
 	if err != nil {

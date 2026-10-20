@@ -16,6 +16,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -83,14 +84,15 @@ func runFront(args []string) {
 	domains := fs.String("domains", "", "comma-separated domains whose TLS is intercepted")
 	caDir := fs.String("ca-dir", "", "directory with ca.pem and ca.key")
 	admin := fs.String("admin", "", "loopback address for GET /stats")
-	indexMiB := fs.Int64("index-mib", 512, "content indexed as held by the decoder; keep below its -cache-mib; costs up to an eighth of it")
+	indexMiB := fs.Int64("index-mib", 230, "content indexed as held by the decoder; keep at about 90% of its -cache-mib; costs up to an eighth of it")
 	maxBodyMiB := fs.Int64("max-body-mib", 64, "largest body that is deduplicated; larger ones pass through")
 	inflightMiB := fs.Int64("inflight-mib", 128, "memory for requests being deduplicated, 3x body + 2 MiB each; others pass through")
 	maxConns := fs.Int("max-conns", 256, "open proxy connections; more are refused (0 = no limit)")
 	memoryMiB := fs.Int64("memory-mib", 0, "Go soft memory limit (0 = index/8 + inflight + 64; GOMEMLIMIT overrides)")
 	oomScore := fs.Int("oom-score-adj", 500, "raise oom_score_adj to this so the kernel kills the front before the proxy (0 = leave)")
 	compressFlag := fs.String("compress", "auto", "CPU for content the decoder lacks: auto, huffman (cheaper) or off (cache only)")
-	probe := fs.Duration("probe-interval", 15*time.Second, "decoder health check interval")
+	probe := fs.Duration("probe-interval", 5*time.Second, "decoder health check interval")
+	drain := fs.Duration("drain", 30*time.Second, "on SIGTERM, time for open requests to finish; a successor may already listen")
 	fs.Parse(args)
 	if *via == "" || *caDir == "" {
 		log.Fatal("-via and -ca-dir are required")
@@ -150,12 +152,20 @@ func runFront(args []string) {
 	}()
 	serveAdmin(*admin, f.snapshot)
 
-	ln, err := net.Listen("tcp", *listen)
+	ln, err := bind(*listen)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("dedup front on %s for %s via %s -> %s", *listen, strings.Join(list, ","), viaURL.Host, decURL)
-	log.Fatal(f.serve(ln))
+	go func() {
+		if err := f.serve(ln); !errors.Is(err, net.ErrClosed) {
+			log.Fatal(err)
+		}
+	}()
+	untilSignal(*drain, func(ctx context.Context) {
+		ln.Close()
+		f.shutdown(ctx)
+	})
 }
 
 func runBack(args []string) {
@@ -163,9 +173,10 @@ func runBack(args []string) {
 	listen := fs.String("listen", "", "listen address, host:port or unix:/path")
 	domains := fs.String("domains", "", "comma-separated origins requests may name")
 	admin := fs.String("admin", "", "loopback address for GET /stats")
-	cacheMiB := fs.Int64("cache-mib", 512, "chunk bytes kept; they cost about 1.25x this")
+	cacheMiB := fs.Int64("cache-mib", 256, "chunk bytes kept; they cost about 1.25x this")
 	maxBodyMiB := fs.Int64("max-body-mib", 64, "largest body that is deduplicated")
-	inflightMiB := fs.Int64("inflight-mib", 128, "memory for frames being rebuilt; past it the front resends originals, which stream")
+	inflightMiB := fs.Int64("inflight-mib", 64, "memory for frames being rebuilt; past it the front resends originals, which stream")
+	drain := fs.Duration("drain", 30*time.Second, "on SIGTERM, time for open requests to finish")
 	memoryMiB := fs.Int64("memory-mib", 0, "Go soft memory limit (0 = cache*1.25 + inflight + 64; GOMEMLIMIT overrides)")
 	oomScore := fs.Int("oom-score-adj", 500, "raise oom_score_adj to this so the kernel kills the back before the anytls server (0 = leave)")
 	resolve := fs.String("resolve", "", "test only: comma-separated host:port=addr:port origin overrides")
@@ -209,18 +220,19 @@ func runBack(args []string) {
 	dec.hosts = mustDomains(*domains)
 	serveAdmin(*admin, dec.snapshot)
 
-	network, address := "tcp", *listen
-	if path, ok := strings.CutPrefix(*listen, "unix:"); ok {
-		network, address = "unix", path
-		os.Remove(path)
-	}
-	ln, err := net.Listen(network, address)
+	ln, err := bind(*listen)
 	if err != nil {
 		log.Fatal(err)
 	}
 	server := &http.Server{Handler: dec, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second}
 	log.Printf("dedup back on %s for %s", *listen, strings.Join(dec.hosts, ","))
-	log.Fatal(server.Serve(ln))
+	go func() {
+		if err := server.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}()
+	// Meanwhile the front sends new requests straight to their origins.
+	untilSignal(*drain, func(ctx context.Context) { server.Shutdown(ctx) })
 }
 
 // serveAdmin serves GET /stats on addr, if set, and logs changes every minute.
@@ -231,7 +243,12 @@ func serveAdmin(addr string, snapshot func() map[string]any) {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(snapshot())
 		})
-		go func() { log.Fatal(http.ListenAndServe(addr, mux)) }()
+		ln, err := bind(addr)
+		if err != nil {
+			log.Printf("admin: %v", err)
+		} else {
+			go http.Serve(ln, mux)
+		}
 	}
 	go func() {
 		var last string
