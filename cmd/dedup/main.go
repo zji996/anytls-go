@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -90,6 +91,11 @@ func runFront(args []string) {
 	fs.Parse(args)
 	if *via == "" || *caDir == "" {
 		log.Fatal("-via and -ca-dir are required")
+	}
+	// On an otherwise idle 4-core Cortex-A53 router, GC mark workers on idle
+	// Ps doubled the front's CPU with no gain in latency.
+	if os.Getenv("GOMAXPROCS") == "" {
+		runtime.GOMAXPROCS(1)
 	}
 	viaURL, err := url.Parse(*via)
 	if err != nil || viaURL.Scheme != "socks5" || viaURL.Host == "" {
