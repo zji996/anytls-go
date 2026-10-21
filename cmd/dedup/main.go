@@ -187,18 +187,24 @@ func (c laneConfig) newLane(user, pass string) *lane {
 	direct := newProxy(route{via: &via})
 	enc.origin = direct.Transport
 	log.Printf("lane %q via %s", user, via.Host)
-	go probeLoop(enc, c.decoder, c.probe)
-	return &lane{name: user, enc: enc, direct: direct, dial: func(ctx context.Context, dest M.Socksaddr) (net.Conn, error) {
+	probed := make(chan struct{})
+	go probeLoop(enc, c.decoder, c.probe, probed)
+	return &lane{name: user, enc: enc, direct: direct, probed: probed, dial: func(ctx context.Context, dest M.Socksaddr) (net.Conn, error) {
 		return socksClient.DialContext(ctx, N.NetworkTCP, dest)
 	}}
 }
 
 // probeLoop checks the decoder every interval while it answers, and backs off
-// to a minute while it does not: most exits of a router may have none.
-func probeLoop(enc *encoder, decoder *url.URL, interval time.Duration) {
+// to a minute while it does not: most exits of a router may have none. It
+// closes probed after the first check.
+func probeLoop(enc *encoder, decoder *url.URL, interval time.Duration, probed chan<- struct{}) {
 	wait := interval
 	for {
 		enc.probe(context.Background(), decoder)
+		if probed != nil {
+			close(probed)
+			probed = nil
+		}
 		if enc.healthy() {
 			wait = interval
 		} else {

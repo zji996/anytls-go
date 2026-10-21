@@ -27,7 +27,7 @@ import (
 // front is the router side. It takes SOCKS5 and HTTP proxy connections and
 // terminates TLS to allowlisted names on port 443 with leaves from the private
 // CA, so the encoder sees their requests. Every other connection, and every
-// connection while no decoder answers, is relayed unchanged through its lane.
+// connection of a lane that has not found a decoder, is relayed unchanged.
 type front struct {
 	domains domainList
 	ca      *authority
@@ -55,6 +55,29 @@ type lane struct {
 	// direct serves intercepted requests while the decoder is down.
 	direct *httputil.ReverseProxy
 	dial   func(ctx context.Context, dest M.Socksaddr) (net.Conn, error)
+	// probed, if set, is closed once the lane's first decoder probe is done.
+	probed <-chan struct{}
+}
+
+// firstProbeWait bounds how long a new lane's first connection waits for the
+// decoder probe. Most exits answer in well under a second.
+const firstProbeWait = 3 * time.Second
+
+// intercepts reports whether the lane terminates TLS to allowlisted names. A
+// connection is decided once and clients keep HTTP/2 connections for hours,
+// so a new lane waits for its first probe, and a lane that has found its
+// decoder keeps intercepting while it is down: each request then goes to the
+// origin directly, and framing resumes on the same connection.
+func (l *lane) intercepts() bool {
+	if l.probed != nil {
+		wait := time.NewTimer(firstProbeWait)
+		select {
+		case <-l.probed:
+		case <-wait.C:
+		}
+		wait.Stop()
+	}
+	return l.enc.healthy() || l.enc.lastEpoch.Load().(string) != ""
 }
 
 // laneSet makes a lane on first use for each SOCKS5 username and password,
@@ -277,7 +300,7 @@ func (f *front) connect(ctx context.Context, conn net.Conn, dest M.Socksaddr, l 
 		peeked, name := peekServerName(conn)
 		conn.SetReadDeadline(time.Time{})
 		conn = &prefixConn{Conn: conn, r: io.MultiReader(bytes.NewReader(peeked), conn)}
-		if name != "" && f.domains.match(name) && l.enc.healthy() {
+		if name != "" && f.domains.match(name) && l.intercepts() {
 			f.intercepted.Add(1)
 			return f.intercept(conn, l)
 		}

@@ -362,6 +362,20 @@ func (s *authSOCKS) count(user string) (n int, others []string) {
 	return n, others
 }
 
+// A lane that has found its decoder intercepts new connections while the
+// decoder is down, and sends their requests to the origin.
+func TestFrontKeepsInterceptingWhileDecoderPauses(t *testing.T) {
+	c := newFrontChain(t, true)
+	c.enc.pause("test", errStatus(503))
+	resp := c.post(t, c.client, conversation(1, []string{image(100 << 10)}))
+	if !issuedByCA(resp, c.ca) {
+		t.Fatal("passed through although the lane had found its decoder")
+	}
+	if s := c.front.snapshot(); s["framed"].(int64) != 0 || s["passed_conns"].(int64) != 0 {
+		t.Fatalf("want the request sent plain on an intercepted connection: %v", s)
+	}
+}
+
 func TestLaneDialsViaWithItsUser(t *testing.T) {
 	origin := newTLSOrigin(t)
 	originAddr := origin.srv.Listener.Addr().String()
@@ -423,32 +437,20 @@ func TestLaneDialsViaWithItsUser(t *testing.T) {
 		}}
 	}
 	bob := client("bob")
-	// The first connection makes the lane, which then probes its decoder.
-	resp, err := bob.Get("https://other.test/")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-	var l *lane
-	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-		if l = f.lanes.get("bob", "pw"); l.enc.healthy() {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("lane bob never found its decoder")
-		}
-	}
+	// The first connection makes the lane. It waits for the lane's first probe:
+	// a client may keep this connection for hours.
 	body := conversation(1, []string{image(300 << 10)})
-	resp, err = bob.Post("https://example.com/backend-api/codex/responses", "application/json", bytes.NewReader(body))
+	resp, err := bob.Post("https://example.com/backend-api/codex/responses", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	l := f.lanes.get("bob", "pw")
 	if !issuedByCA(resp, ca) || l.enc.stats.framed.Load() != 1 {
-		t.Fatalf("want bob's request intercepted and framed: %v", l.enc.snapshot())
+		t.Fatalf("want bob's first request intercepted and framed: %v", l.enc.snapshot())
 	}
-	// The passthrough, and the probe whose connection the framed request reuses.
-	if n, others := via.count("bob"); n < 2 || len(others) != 0 {
+	// The probe, whose connection the framed request reuses.
+	if n, others := via.count("bob"); n < 1 || len(others) != 0 {
 		t.Fatalf("via saw bob %d times and also %v", n, others)
 	}
 	// An exit the router does not know must not be reached some other way.
