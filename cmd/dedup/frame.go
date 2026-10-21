@@ -18,12 +18,13 @@ import (
 const frameMagic = "EDG1"
 
 type encodeResult struct {
-	frame     []byte
-	refBytes  int
-	litBytes  int
-	refs      int
-	literals  int
-	refHashes []digest
+	frame    []byte
+	refBytes int
+	litBytes int
+	refs     int
+	literals int
+	// litHashes are the chunks this frame claimed in the index; the caller
+	// settles them once the decoder has answered or cannot have read them.
 	litHashes []digest
 }
 
@@ -50,31 +51,49 @@ func parseCompression(s string) (compression, error) {
 }
 
 // encodeFrame replaces chunks the peer is believed to hold with references.
+// Records are streamed into the deflater from body, so besides body only the
+// frame is held: 2x the body at most, which the encoder's budget counts on.
 func encodeFrame(body []byte, known *lru, mode compression) (encodeResult, error) {
 	var res encodeResult
-	// Sized once: like readBody, growing multi-MiB buffers stalls small routers.
-	// A record is at most a varint longer than its chunk.
-	records := bytes.NewBuffer(make([]byte, 0, len(body)+(len(body)/minChunk+2)*(1+binary.MaxVarintLen64)))
-	var tmp [binary.MaxVarintLen64]byte
-	for _, piece := range chunks(body) {
+	pieces := chunks(body)
+	sums := make([]digest, len(pieces))
+	literal := make([]bool, len(pieces))
+	inFrame := map[digest]bool{}
+	size := 1 // the closing 'E'
+	for i, piece := range pieces {
 		sum := sha256.Sum256(piece)
-		if _, ok := known.get(sum); ok {
-			records.WriteByte('R')
-			records.Write(sum[:])
+		sums[i] = sum
+		// A repeat of a literal earlier in this frame is a reference: the decoder
+		// caches literals as it reads them.
+		if inFrame[sum] || known.claim(sum, len(piece)) {
+			size += 1 + len(sum)
 			res.refs++
 			res.refBytes += len(piece)
-			res.refHashes = append(res.refHashes, sum)
 			continue
 		}
-		known.put(sum, len(piece), nil)
+		inFrame[sum] = true
+		literal[i] = true
 		res.litHashes = append(res.litHashes, sum)
-		records.WriteByte('L')
-		records.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(piece)))])
-		records.Write(piece)
+		size += 1 + uvarintLen(uint64(len(piece))) + len(piece)
 		res.literals++
 		res.litBytes += len(piece)
 	}
-	records.WriteByte('E')
+	writeRecords := func(w io.Writer) error {
+		bw := bufio.NewWriterSize(w, 64<<10)
+		var tmp [binary.MaxVarintLen64]byte
+		for i, piece := range pieces {
+			if !literal[i] {
+				bw.WriteByte('R')
+				bw.Write(sums[i][:])
+				continue
+			}
+			bw.WriteByte('L')
+			bw.Write(tmp[:binary.PutUvarint(tmp[:], uint64(len(piece)))])
+			bw.Write(piece)
+		}
+		bw.WriteByte('E')
+		return bw.Flush()
+	}
 	level := flate.BestSpeed
 	switch mode {
 	case compressHuffman:
@@ -82,35 +101,40 @@ func encodeFrame(body []byte, known *lru, mode compression) (encodeResult, error
 	case compressOff:
 		level = flate.NoCompression
 	}
-	frame, err := deflate(records.Bytes(), level)
-	if err != nil {
+	// Sized once: like readBody, growing multi-MiB buffers stalls small routers.
+	// Stored blocks are deflate's worst case.
+	buf := bytes.NewBuffer(make([]byte, 0, len(frameMagic)+size+size/64+64))
+	if err := deflate(buf, writeRecords, level); err != nil {
 		return res, err
 	}
 	// Since Go 1.27 BestSpeed stores what it cannot match, such as base64
-	// images, which Huffman coding alone still shrinks by a quarter.
-	if mode == compressAuto && len(frame)*10 > records.Len()*9 {
-		frame = nil
-		if frame, err = deflate(records.Bytes(), flate.HuffmanOnly); err != nil {
+	// images, which Huffman coding alone still shrinks by a quarter. The
+	// records are rebuilt from body, so the same buffer takes the second try.
+	if mode == compressAuto && buf.Len()*10 > size*9 {
+		buf.Reset()
+		if err := deflate(buf, writeRecords, flate.HuffmanOnly); err != nil {
 			return res, err
 		}
 	}
-	res.frame = frame
+	res.frame = buf.Bytes()
 	return res, nil
 }
 
-func deflate(records []byte, level int) ([]byte, error) {
-	// Room for stored blocks, deflate's worst case.
-	buf := bytes.NewBuffer(make([]byte, 0, len(frameMagic)+len(records)+len(records)/64+64))
+func uvarintLen(x uint64) int {
+	var tmp [binary.MaxVarintLen64]byte
+	return binary.PutUvarint(tmp[:], x)
+}
+
+func deflate(buf *bytes.Buffer, writeRecords func(io.Writer) error, level int) error {
 	buf.WriteString(frameMagic)
 	zw, err := flate.NewWriter(buf, level)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	zw.Write(records)
-	if err := zw.Close(); err != nil {
-		return nil, err
+	if err := writeRecords(zw); err != nil {
+		return err
 	}
-	return buf.Bytes(), nil
+	return zw.Close()
 }
 
 var errFrame = errors.New("malformed dedup frame")

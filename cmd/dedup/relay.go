@@ -139,6 +139,9 @@ type encoder struct {
 
 	// inflight may be shared by the encoders of several exits.
 	inflight *budget
+	// inflightWait is how long a request may wait for inflight memory before
+	// it goes out plain; a plain resend of a large body costs far longer.
+	inflightWait time.Duration
 	// origin, if set, sends a framed request straight to its origin when the
 	// decoder cannot be reached.
 	origin   http.RoundTripper
@@ -152,10 +155,17 @@ const unmarkedLimit = 3
 type frameCtxKey struct{}
 
 type framedRequest struct {
-	body []byte
-	refs []digest
-	lits []digest
-	held *share
+	body    []byte
+	lits    []digest
+	held    *share
+	known   *lru
+	settled sync.Once
+}
+
+// settle ends the frame's claims on its literals, once: held if the decoder
+// read the frame, else forgotten so that no later frame refers to them.
+func (f *framedRequest) settle(read bool) {
+	f.settled.Do(func() { f.known.settle(f.lits, read) })
 }
 
 // done drops the body once a response or a final error is in: nothing will
@@ -261,6 +271,9 @@ func (e *encoder) eligible(r *http.Request) bool {
 type budget struct {
 	limit int64 // 0 is no limit
 	used  atomic.Int64
+
+	mu    sync.Mutex
+	freed chan struct{} // closed on the next release, while someone waits
 }
 
 // requestOverhead is what a request holds besides its body and frame: flate
@@ -281,6 +294,12 @@ func (b *budget) reserve(n int64) bool {
 func (b *budget) release(n int64) {
 	if b.limit != 0 {
 		b.used.Add(-n)
+		b.mu.Lock()
+		if b.freed != nil {
+			close(b.freed)
+			b.freed = nil
+		}
+		b.mu.Unlock()
 	}
 }
 
@@ -290,6 +309,34 @@ func (b *budget) take(n int64) *share {
 		return nil
 	}
 	return &share{b: b, n: n}
+}
+
+// takeWithin is take, waiting up to wait for other shares to shrink.
+func (b *budget) takeWithin(ctx context.Context, n int64, wait time.Duration) *share {
+	if s := b.take(n); s != nil || wait <= 0 || n > b.limit {
+		return s
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		// Subscribe before retrying, so a release in between is not missed.
+		b.mu.Lock()
+		if b.freed == nil {
+			b.freed = make(chan struct{})
+		}
+		freed := b.freed
+		b.mu.Unlock()
+		if s := b.take(n); s != nil {
+			return s
+		}
+		select {
+		case <-freed:
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+			return nil
+		}
+	}
 }
 
 // share is one request's part of a budget. It shrinks as its buffers become
@@ -353,8 +400,8 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		e.proxy.ServeHTTP(w, r)
 		return
 	}
-	// The body, its uncompressed records and a frame, each about as large.
-	held := e.inflight.take(3*r.ContentLength + requestOverhead)
+	// The body and a frame, which is at most about as large.
+	held := e.inflight.takeWithin(r.Context(), 2*r.ContentLength+requestOverhead, e.inflightWait)
 	if held == nil {
 		e.stats.busy.Add(1)
 		e.stats.plain.Add(1)
@@ -369,6 +416,7 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := encodeFrame(body, e.known, e.compress)
 	if err != nil {
+		e.known.settle(res.litHashes, false)
 		log.Printf("encode: %v; sending plain", err)
 		e.stats.plain.Add(1)
 		r.Body = io.NopCloser(bytes.NewReader(body))
@@ -381,9 +429,11 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	e.stats.original.Add(int64(len(body)))
 	e.stats.sent.Add(int64(len(res.frame)))
 	e.stats.refBytes.Add(int64(res.refBytes))
-	framed := &framedRequest{body: body, refs: res.refHashes, lits: res.litHashes, held: held}
+	framed := &framedRequest{body: body, lits: res.litHashes, held: held, known: e.known}
+	// Unanswered claims would keep their chunks from being referenced.
+	defer framed.settle(false)
 	r = r.WithContext(context.WithValue(r.Context(), frameCtxKey{}, framed))
-	r.Body = &releasingBody{b: res.frame}
+	r.Body = &releasingBody{b: res.frame, done: func() { held.shrink(int64(len(body))) }}
 	r.ContentLength = int64(len(res.frame))
 	r.Header.Set(hdrFrame, "1")
 	r.Header.Set(hdrLen, strconv.Itoa(len(body)))
@@ -404,6 +454,11 @@ func (e *encoder) send(base http.RoundTripper, req *http.Request, framed *framed
 	resp, err := base.RoundTrip(req)
 	if err != nil {
 		e.pause("decoder request", err)
+		if framed != nil {
+			// The decoder may never have read the frame. Should it have, the
+			// chunks only travel once more as literals.
+			framed.settle(false)
+		}
 		if framed != nil && e.origin != nil && req.Context().Err() == nil {
 			// The body is still here; without a decoder only the origin is left.
 			e.stats.fallbacks.Add(1)
@@ -422,20 +477,19 @@ func (e *encoder) send(base http.RoundTripper, req *http.Request, framed *framed
 		return e.misdelivered(base, req, framed, resp)
 	}
 	if resp.StatusCode != http.StatusConflict || resp.Header.Get(hdrMissing) == "" {
+		framed.settle(true)
 		return resp, nil
 	}
 	// The decoder lacks some chunks: forget them and resend the original body.
+	// It cached the frame's literals all the same, unless it was too busy to
+	// read the frame at all.
+	framed.settle(resp.Header.Get(hdrMissing) != "0")
 	hashes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	if resp.Header.Get(hdrReset) != "" {
 		e.known.reset()
 		e.stats.resets.Add(1)
-	} else if resp.Header.Get(hdrMissing) == "0" {
-		// A busy decoder drained the frame unread, literals included.
-		for _, d := range framed.lits {
-			e.known.remove(d)
-		}
-	} else {
+	} else if resp.Header.Get(hdrMissing) != "0" {
 		for i := 0; i+len(digest{}) <= len(hashes); i += len(digest{}) {
 			var d digest
 			copy(d[:], hashes[i:])
@@ -451,6 +505,7 @@ func (e *encoder) send(base http.RoundTripper, req *http.Request, framed *framed
 // the reader rejected it unprocessed, so the original is resent; anything else
 // is returned as is, because resending could run the request twice.
 func (e *encoder) misdelivered(base http.RoundTripper, req *http.Request, framed *framedRequest, resp *http.Response) (*http.Response, error) {
+	framed.settle(false)
 	if e.epoch.Swap("") != "" {
 		log.Printf("frame %s %s answered %d without a decoder epoch; framing paused", req.Method, req.URL.Path, resp.StatusCode)
 	}

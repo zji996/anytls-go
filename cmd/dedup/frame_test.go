@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"math/rand/v2"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -53,7 +54,8 @@ func BenchmarkEncode(b *testing.B) {
 	b.Run("cached", func(b *testing.B) {
 		body := prose(4 << 20)
 		known := newLRU(64 << 20)
-		encodeFrame(body, known, compressAuto)
+		first, _ := encodeFrame(body, known, compressAuto)
+		known.settle(first.litHashes, true)
 		b.SetBytes(int64(len(body)))
 		for b.Loop() {
 			encodeFrame(body, known, compressAuto)
@@ -81,6 +83,72 @@ func TestFrameModesRoundTrip(t *testing.T) {
 				t.Errorf("%s/off compressed: ratio %.2f", name, ratio)
 			}
 		}
+	}
+}
+
+// A chunk is referenced only once a frame carrying it has been read, so a
+// frame racing an unanswered one never names chunks the decoder lacks.
+func TestUnansweredChunksAreSentAgain(t *testing.T) {
+	known := newLRU(64 << 20)
+	body := prose(400 << 10)
+	first, _ := encodeFrame(body, known, compressAuto)
+	second, _ := encodeFrame(body, known, compressAuto)
+	if second.refs != 0 || second.literals != first.literals {
+		t.Fatalf("second frame referenced %d chunks still in flight", second.refs)
+	}
+	known.settle(first.litHashes, true)
+	// The second frame was lost, but the first was read.
+	known.settle(second.litHashes, false)
+	third, _ := encodeFrame(body, known, compressAuto)
+	if third.literals != 0 {
+		t.Fatalf("third frame resent %d held chunks", third.literals)
+	}
+}
+
+func TestLostFrameForgetsItsChunks(t *testing.T) {
+	known := newLRU(64 << 20)
+	body := prose(400 << 10)
+	first, _ := encodeFrame(body, known, compressAuto)
+	known.settle(first.litHashes, false)
+	if entries, _ := known.stats(); entries != 0 {
+		t.Fatalf("index kept %d chunks of a lost frame", entries)
+	}
+	// Settling twice, or after an eviction, is harmless.
+	known.settle(first.litHashes, false)
+}
+
+func TestRepeatWithinFrameIsReferenced(t *testing.T) {
+	part := prose(400 << 10)
+	body := append(append([]byte{}, part...), part...)
+	res, err := encodeFrame(body, newLRU(64<<20), compressOff)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.refs == 0 {
+		t.Fatal("a repeat inside one frame was sent as literals")
+	}
+	got, missing, err := decodeFrame(res.frame, len(body), newLRU(64<<20))
+	if err != nil || len(missing) != 0 || !bytes.Equal(got, body) {
+		t.Fatalf("err %v, missing %d", err, len(missing))
+	}
+}
+
+// The encoder budgets 2x the body: the body itself and the frame. Base64
+// makes auto mode deflate twice, which must reuse the frame's buffer.
+func TestEncodeAllocatesOneFrame(t *testing.T) {
+	body := []byte(image(8 << 20))
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	res, err := encodeFrame(body, newLRU(64<<20), compressAuto)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ratio := float64(after.TotalAlloc-before.TotalAlloc) / float64(len(body))
+	t.Logf("allocated %.3fx the body for a %.3fx frame", ratio, float64(len(res.frame))/float64(len(body)))
+	if ratio > 1.25 {
+		t.Fatalf("encoding allocated %.2fx the body", ratio)
 	}
 }
 

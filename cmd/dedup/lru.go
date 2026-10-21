@@ -22,6 +22,10 @@ type lruEntry struct {
 	key   digest
 	size  int64
 	value []byte
+	// Encoder only: frames carrying the chunk that have no answer yet, and
+	// whether the decoder has read one of them.
+	pending int32
+	held    bool
 }
 
 func newLRU(capacity int64) *lru {
@@ -36,17 +40,58 @@ func (c *lru) put(key digest, size int, value []byte) {
 		c.order.MoveToFront(el)
 		return
 	}
-	c.items[key] = c.order.PushFront(&lruEntry{key: key, size: int64(size), value: value})
-	c.used += int64(size)
+	c.addLocked(&lruEntry{key: key, size: int64(size), value: value})
+}
+
+// claim is the encoder's lookup: it reports whether the decoder holds key.
+// Otherwise one more frame is about to carry the chunk, until settle.
+func (c *lru) claim(key digest, size int) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.items[key]; ok {
+		c.order.MoveToFront(el)
+		entry := el.Value.(*lruEntry)
+		if entry.held {
+			return true
+		}
+		entry.pending++
+		return false
+	}
+	c.addLocked(&lruEntry{key: key, size: int64(size), pending: 1})
+	return false
+}
+
+// settle ends a frame's claims. Read by the decoder, its chunks are held;
+// otherwise each is dropped unless held already or still in another frame.
+func (c *lru) settle(keys []digest, read bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, key := range keys {
+		el, ok := c.items[key]
+		if !ok {
+			continue
+		}
+		entry := el.Value.(*lruEntry)
+		if entry.pending > 0 {
+			entry.pending--
+		}
+		if read {
+			entry.held = true
+		} else if !entry.held && entry.pending == 0 {
+			c.removeLocked(el)
+		}
+	}
+}
+
+func (c *lru) addLocked(entry *lruEntry) {
+	c.items[entry.key] = c.order.PushFront(entry)
+	c.used += entry.size
 	for c.used > c.capacity {
 		last := c.order.Back()
 		if last == nil {
 			break
 		}
-		entry := last.Value.(*lruEntry)
-		c.order.Remove(last)
-		delete(c.items, entry.key)
-		c.used -= entry.size
+		c.removeLocked(last)
 	}
 }
 
@@ -66,10 +111,15 @@ func (c *lru) remove(key digest) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.items[key]; ok {
-		c.used -= el.Value.(*lruEntry).size
-		c.order.Remove(el)
-		delete(c.items, key)
+		c.removeLocked(el)
 	}
+}
+
+func (c *lru) removeLocked(el *list.Element) {
+	entry := el.Value.(*lruEntry)
+	c.used -= entry.size
+	c.order.Remove(el)
+	delete(c.items, entry.key)
 }
 
 func (c *lru) reset() {

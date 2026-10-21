@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -178,5 +179,33 @@ func TestPreferOOMKillOnlyRaises(t *testing.T) {
 	preferOOMKill(200)
 	if got, _ := os.ReadFile(path); string(got) != "300\n" {
 		t.Fatalf("lowered to %q", got)
+	}
+}
+
+func TestBudgetWaitsForRelease(t *testing.T) {
+	b := &budget{limit: 10}
+	first := b.take(8)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		first.shrink(2)
+	}()
+	start := time.Now()
+	second := b.takeWithin(context.Background(), 8, time.Second)
+	if second == nil {
+		t.Fatal("no share after the first shrank")
+	}
+	if waited := time.Since(start); waited < 40*time.Millisecond {
+		t.Fatalf("got a share after %v, before any release", waited)
+	}
+	if b.takeWithin(context.Background(), 8, 30*time.Millisecond) != nil {
+		t.Fatal("got a share over the limit")
+	}
+	if b.takeWithin(context.Background(), 11, time.Hour) != nil {
+		t.Fatal("waited for a share larger than the limit")
+	}
+	first.free()
+	second.free()
+	if b.used.Load() != 0 {
+		t.Fatalf("budget leaked %d", b.used.Load())
 	}
 }

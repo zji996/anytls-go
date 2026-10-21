@@ -466,3 +466,52 @@ func TestEncoderViaProxyToPublicOrigin(t *testing.T) {
 		}
 	}
 }
+
+// A frame lost on the way to the decoder must not leave its chunks in the
+// index, or the next turn names them and pays for a plain resend.
+func TestLostFrameCostsNoResend(t *testing.T) {
+	c := newChain(t, 64<<20)
+	var lose atomic.Bool
+	lose.Store(true)
+	c.decSrv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !lose.Load() {
+			c.dec.ServeHTTP(w, r)
+			return
+		}
+		io.Copy(io.Discard, r.Body)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			conn.Close()
+		}
+	})
+	images := []string{image(300 << 10), image(300 << 10)}
+	resp, err := http.Post(c.encSrv.URL+"/v1/responses", "application/json", bytes.NewReader(conversation(1, images)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("lost frame answered %d, want 502", resp.StatusCode)
+	}
+	if entries, _ := c.enc.known.stats(); entries != 0 {
+		t.Fatalf("index kept %d chunks of the lost frame", entries)
+	}
+	lose.Store(false)
+	c.get(t, "/health")
+	c.post(t, conversation(2, images))
+	if retries := c.enc.snapshot()["retries"].(int64); retries != 0 {
+		t.Fatalf("encoder resent %d times after a lost frame", retries)
+	}
+}
+
+// An answered frame's chunks are held: the next turn refers to them.
+func TestAnsweredFramesAreReferenced(t *testing.T) {
+	c := newChain(t, 64<<20)
+	images := []string{image(300 << 10), image(300 << 10)}
+	c.post(t, conversation(1, images))
+	c.post(t, conversation(2, images))
+	s := c.enc.snapshot()
+	if s["retries"].(int64) != 0 || s["ref_bytes"].(int64) < 300<<10 {
+		t.Fatalf("second turn did not reference the first: %v", s)
+	}
+}

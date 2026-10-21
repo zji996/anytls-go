@@ -86,7 +86,8 @@ func runFront(args []string) {
 	admin := fs.String("admin", "", "loopback address for GET /stats")
 	indexMiB := fs.Int64("index-mib", 230, "content indexed as held by each exit's decoder; keep at about 90% of its -cache-mib; costs up to an eighth of it")
 	maxBodyMiB := fs.Int64("max-body-mib", 64, "largest body that is deduplicated; larger ones pass through")
-	inflightMiB := fs.Int64("inflight-mib", 128, "memory for requests being deduplicated, 3x body + 2 MiB each; others pass through")
+	inflightMiB := fs.Int64("inflight-mib", 128, "memory for requests being deduplicated, 2x body + 2 MiB each; others pass through")
+	inflightWait := fs.Duration("inflight-wait", 3*time.Second, "how long a request may wait for -inflight-mib before it passes through")
 	maxConns := fs.Int("max-conns", 256, "open proxy connections; more are refused (0 = no limit)")
 	memoryMiB := fs.Int64("memory-mib", 0, "Go soft memory limit (0 = index/8 + inflight + 64; GOMEMLIMIT overrides)")
 	oomScore := fs.Int("oom-score-adj", 500, "raise oom_score_adj to this so the kernel kills the front before the proxy (0 = leave)")
@@ -131,7 +132,7 @@ func runFront(args []string) {
 	}
 	lc := laneConfig{
 		via: viaURL, decoder: decURL, indexBytes: *indexMiB << 20, maxBody: *maxBodyMiB << 20,
-		inflight: &budget{limit: *inflightMiB << 20}, compress: mode, probe: *probe,
+		inflight: &budget{limit: *inflightMiB << 20}, inflightWait: *inflightWait, compress: mode, probe: *probe,
 	}
 	f := newFront(list, ca, newLaneSet(maxLanes, lc.newLane))
 	f.maxConns = *maxConns
@@ -161,6 +162,7 @@ type laneConfig struct {
 	via, decoder        *url.URL
 	indexBytes, maxBody int64
 	inflight            *budget
+	inflightWait        time.Duration
 	compress            compression
 	probe               time.Duration
 }
@@ -180,6 +182,7 @@ func (c laneConfig) newLane(user, pass string) *lane {
 	socksClient := socks.NewClient(N.SystemDialer, M.ParseSocksaddr(via.Host), socks.Version5, viaUser, viaPass)
 	enc := newEncoder(route{url: c.decoder, via: &via}, c.indexBytes, c.maxBody)
 	enc.inflight = c.inflight
+	enc.inflightWait = c.inflightWait
 	enc.compress = c.compress
 	direct := newProxy(route{via: &via})
 	enc.origin = direct.Transport
