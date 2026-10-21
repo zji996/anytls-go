@@ -17,7 +17,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sirupsen/logrus"
@@ -35,7 +34,11 @@ func main() {
 	minIdleSession := flag.Int("m", 5, "Reserved min idle session")
 	prewarm := flag.Int("prewarm", 0, "Pre-create idle sessions for lower first-request latency")
 	probe := flag.Bool("probe", false, "Run a one-shot end-to-end AnyTLS health probe")
+	probeDedup := flag.Bool("probe-dedup", false, "Probe the dedup decoder through AnyTLS and print its epoch")
 	flag.Parse()
+	if *probe && *probeDedup {
+		logrus.Fatalln("set only one of -probe and -probe-dedup")
+	}
 
 	if serverURL, err := url.Parse(*serverAddr); err == nil {
 		if serverURL.Scheme == "anytls" {
@@ -124,17 +127,27 @@ func main() {
 		if err != nil {
 			return nil, err
 		}
+		if *probe || *probeDedup {
+			// Bound TLS/authentication and stream creation as well as HTTP I/O.
+			if deadline, ok := ctx.Deadline(); ok {
+				if err := conn.SetDeadline(deadline); err != nil {
+					conn.Close()
+					return nil, err
+				}
+			}
+			probeConn := conn
+			context.AfterFunc(ctx, func() { _ = probeConn.Close() })
+		}
 		conn = tls.Client(conn, tlsConfig)
 		return conn, nil
 	}, *minIdleSession)
-	if *probe {
-		probeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		defer cancel()
-		defer client.Close()
-		if err := runHealthProbe(probeCtx, client); err != nil {
+	if *probe || *probeDedup {
+		if err := runOneShotProbe(ctx, client, *probeDedup, os.Stdout); err != nil {
 			logrus.Fatalln("health probe failed:", err)
 		}
-		logrus.Infoln("health probe succeeded")
+		if !*probeDedup {
+			logrus.Infoln("health probe succeeded")
+		}
 		return
 	}
 

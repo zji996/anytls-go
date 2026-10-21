@@ -1,17 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Tests are independent of the production candidate coordinator invoking them.
+unset ANYTLS_UPDATE_REPO_ROOT ANYTLS_UPDATE_COMMIT ANYTLS_STAGE_ONLY ANYTLS_UPDATE_STAGED ANYTLS_DEPLOYMENT_LOCK_HELD
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 installer="$script_dir/install-anytls-server.sh"
 test_root="$(mktemp -d)"
-trap 'rm -rf "$test_root"' EXIT
+cleanup_tests() {
+  local status=$?
+  if [[ "$status" != 0 ]]; then
+    echo "installation tests failed (status $status)" >&2
+    for log in "$test_root/dedup-install.log" "$test_root/dedup-doctor.log" "$test_root/expected-failure.log"; do
+      [[ ! -f "$log" ]] || tail -35 "$log" >&2
+    done
+  fi
+  rm -rf "$test_root"
+}
+trap cleanup_tests EXIT
 
 # Prevent mock uninstall test from wiping out the actual repository
 export ANYTLS_TEST_MODE=1
 
 # shellcheck disable=SC1090
 ANYTLS_INSTALLER_LIB_ONLY=1 source "$installer"
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329
 command() {
   if [[ "${1:-}" == "-v" && "${2:-}" == "openssl" ]]; then
     return 1
@@ -36,6 +48,7 @@ real_id="$(command -v id)"
 real_install="$(command -v install)"
 real_go="$(command -v go)"
 real_cp="$(command -v cp)"
+real_git="$(command -v git)"
 
 cat >"$mock_bin/id" <<'EOF'
 #!/usr/bin/env bash
@@ -80,27 +93,67 @@ fi
 exec "$REAL_CP" "$@"
 EOF
 
+cat >"$mock_bin/git" <<'EOF'
+#!/usr/bin/env bash
+if [[ -n "${MOCK_GIT_FAIL_FETCH_ROOT:-}" && "$*" == "-C $MOCK_GIT_FAIL_FETCH_ROOT fetch "* ]]; then
+  echo 'injected fetch failure' >&2
+  exit 42
+fi
+if [[ -n "${MOCK_GIT_INTERRUPT_ROOT:-}" && "$*" == "-C $MOCK_GIT_INTERRUPT_ROOT merge --ff-only "* ]]; then
+  "$REAL_GIT" "$@" || exit $?
+  kill -TERM "$PPID"
+  exit 0
+fi
+exec "$REAL_GIT" "$@"
+EOF
+chmod +x "$mock_bin/git"
 cat >"$mock_bin/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$MOCK_SYSTEMCTL_LOG"
+target="${!#}"
+if [[ "$target" == "${ANYTLS_DEDUP_SERVICE_NAME:-anytls-dedup}" ]]; then
+  MOCK_SYSTEMCTL_ACTIVE="$MOCK_SYSTEMCTL_ACTIVE.dedup"
+  MOCK_SYSTEMCTL_ENABLED="$MOCK_SYSTEMCTL_ENABLED.dedup"
+fi
 case "${1:-}" in
   is-active) [[ -f "$MOCK_SYSTEMCTL_ACTIVE" ]] ;;
   is-enabled) [[ -f "$MOCK_SYSTEMCTL_ENABLED" ]] ;;
-  show) echo 4242 ;;
+  show)
+    case "$*" in
+      *DropInPaths*) exit 0 ;;
+      *MemoryMax*) echo 524288000 ;;
+      *ControlGroup*) echo /mock ;;
+      *) echo 4242 ;;
+    esac
+    ;;
   enable) touch "$MOCK_SYSTEMCTL_ENABLED" ;;
   disable)
     rm -f "$MOCK_SYSTEMCTL_ENABLED"
     [[ "$*" == *"--now"* ]] && rm -f "$MOCK_SYSTEMCTL_ACTIVE"
+    exit 0
     ;;
   restart)
+    if [[ "$target" == "${ANYTLS_DEDUP_SERVICE_NAME:-anytls-dedup}" && -f "${MOCK_DEDUP_FAIL_RESTART_ONCE:-}" ]]; then
+      rm -f "$MOCK_DEDUP_FAIL_RESTART_ONCE"
+      exit 1
+    fi
     if [[ -f "$MOCK_SYSTEMCTL_FAIL_RESTART_ONCE" ]]; then
       rm -f "$MOCK_SYSTEMCTL_FAIL_RESTART_ONCE"
       exit 1
     fi
     [[ ! -f "$MOCK_SYSTEMCTL_FAIL_RESTART" ]] || exit 1
     touch "$MOCK_SYSTEMCTL_ACTIVE"
+    if [[ "$target" == "${ANYTLS_SERVICE_NAME:-}" ]] && grep -Fq "Wants=${ANYTLS_DEDUP_SERVICE_NAME:-}.service" "$ANYTLS_SYSTEMD_UNIT"; then
+      touch "$MOCK_SYSTEMCTL_ACTIVE.dedup"
+    fi
     ;;
-  stop) rm -f "$MOCK_SYSTEMCTL_ACTIVE" ;;
+  stop)
+    if [[ "$target" == "${ANYTLS_DEDUP_SERVICE_NAME:-anytls-dedup}" && -f "${MOCK_DEDUP_FAIL_STOP_ONCE:-}" ]]; then
+      rm -f "$MOCK_DEDUP_FAIL_STOP_ONCE"
+      exit 1
+    fi
+    rm -f "$MOCK_SYSTEMCTL_ACTIVE"
+    ;;
   *) exit 0 ;;
 esac
 EOF
@@ -163,6 +216,7 @@ export REAL_ID="$real_id"
 export REAL_INSTALL="$real_install"
 export REAL_GO="$real_go"
 export REAL_CP="$real_cp"
+export REAL_GIT="$real_git"
 export MOCK_SYSTEMCTL_LOG="$test_root/systemctl.log"
 export MOCK_SYSTEMCTL_FAIL_RESTART="$test_root/fail-restart"
 export MOCK_SYSTEMCTL_FAIL_RESTART_ONCE="$test_root/fail-restart-once"
@@ -185,13 +239,22 @@ export ANYTLS_ENV_FILE="$ANYTLS_CONFIG_DIR/server.env"
 export ANYTLS_PASSWORD_FILE="$ANYTLS_CONFIG_DIR/server.password"
 export ANYTLS_FIREWALL_STATE_FILE="$ANYTLS_CONFIG_DIR/firewall.state"
 export ANYTLS_BIN_PATH="$test_root/usr/local/bin/anytls-server"
+export ANYTLS_PROBE_BIN_PATH="$test_root/usr/local/libexec/anytls-health-probe"
 export ANYTLS_SYSTEMD_UNIT="$test_root/etc/systemd/system/anytls-test.service"
+export ANYTLS_CGROUP_ROOT="$test_root/cgroup"
+mkdir -p "$ANYTLS_CGROUP_ROOT/mock"
+printf '%s\n' 524288000 >"$ANYTLS_CGROUP_ROOT/mock/memory.max"
+export ANYTLS_DEDUP_SERVICE_NAME=anytls-test-dedup
+export ANYTLS_DEDUP_USER=root
+export ANYTLS_DEDUP_BIN_PATH="$test_root/usr/local/bin/anytls-dedup"
+export ANYTLS_DEDUP_RUNTIME_DIR="$test_root/run/anytls-test-dedup"
+export ANYTLS_DEDUP_SYSTEMD_UNIT="$test_root/etc/systemd/system/anytls-test-dedup.service"
 export ANYTLS_DEPLOYMENT_LOCK_FILE="$test_root/anytls-test.install.lock"
 mkdir -p "$(dirname "$ANYTLS_BIN_PATH")" "$(dirname "$ANYTLS_SYSTEMD_UNIT")"
 mkdir -p "$MOCK_FIREWALL_RULE_DIR"
 
 install_args=(
-  install --non-interactive --no-firewall
+  install --non-interactive --no-firewall --without-dedup
   --password 'secret /@value'
   --listen '0.0.0.0:8443'
   --server-name '2001:db8::1'
@@ -307,6 +370,133 @@ reconcile_firewall 9443 >/dev/null
 
 echo "installation flow tests passed"
 
+# Decoder tests share the real installer and independent per-service mocks.
+cat >"$mock_bin/dedup-health" <<'EOF'
+#!/usr/bin/env bash
+[[ ! -f "$MOCK_DEDUP_HEALTH_FAIL" ]] || exit 1
+if [[ "$2" == /health ]]; then
+  echo 0123456789abcdef
+else
+  echo '{"role":"decode","framed":0}'
+fi
+EOF
+cat >"$mock_bin/dedup-probe" <<'EOF'
+#!/usr/bin/env bash
+[[ ! -f "$MOCK_DEDUP_PROBE_FAIL" ]] || exit 1
+if [[ -f "$MOCK_DEDUP_EPOCH_MISMATCH" ]]; then
+  echo fedcba9876543210fedcba9876543210
+else
+  echo "$1"
+fi
+EOF
+chmod +x "$mock_bin/dedup-health" "$mock_bin/dedup-probe"
+export ANYTLS_DEDUP_HEALTH_COMMAND="$mock_bin/dedup-health"
+export ANYTLS_DEDUP_PROBE_COMMAND="$mock_bin/dedup-probe"
+export MOCK_DEDUP_HEALTH_FAIL="$test_root/dedup-health-fail"
+export MOCK_DEDUP_PROBE_FAIL="$test_root/dedup-probe-fail"
+export MOCK_DEDUP_EPOCH_MISMATCH="$test_root/dedup-epoch-mismatch"
+export MOCK_DEDUP_FAIL_RESTART_ONCE="$test_root/dedup-restart-fail-once"
+export MOCK_DEDUP_FAIL_STOP_ONCE="$test_root/dedup-stop-fail-once"
+dedup_args=(install --non-interactive --no-firewall --password decoder-secret --server-name 127.0.0.1 --fallback '')
+"$installer" "${dedup_args[@]}" >"$test_root/dedup-install.log" 2>&1
+[[ -f "$MOCK_SYSTEMCTL_ACTIVE" && -f "$MOCK_SYSTEMCTL_ACTIVE.dedup" ]]
+[[ -f "$MOCK_SYSTEMCTL_ENABLED.dedup" ]]
+grep -q '^ANYTLS_DEDUP_ENABLED=1$' "$ANYTLS_ENV_FILE"
+grep -Fq 'MemoryMax=500M' "$ANYTLS_DEDUP_SYSTEMD_UNIT"
+grep -Fq 'RestartSec=1' "$ANYTLS_DEDUP_SYSTEMD_UNIT"
+grep -Fq 'AF_UNIX' "$ANYTLS_SYSTEMD_UNIT"
+grep -Fq "Wants=$ANYTLS_DEDUP_SERVICE_NAME.service" "$ANYTLS_SYSTEMD_UNIT"
+if rg -q 'Requires=|BindsTo=|PartOf=' "$ANYTLS_SYSTEMD_UNIT"; then exit 1; fi
+"$installer" doctor >"$test_root/dedup-doctor.log" 2>&1
+"$installer" "${dedup_args[@]}" --without-dedup >/dev/null
+[[ -f "$MOCK_SYSTEMCTL_ACTIVE" && ! -e "$MOCK_SYSTEMCTL_ACTIVE.dedup" && ! -e "$MOCK_SYSTEMCTL_ENABLED.dedup" ]]
+grep -q '^ANYTLS_DEDUP_ENABLED=0$' "$ANYTLS_ENV_FILE"
+grep -Eq "^ANYTLS_DEDUP_BACKEND=('')?$" "$ANYTLS_ENV_FILE"
+# An ordinary reinstall preserves an explicit opt-out, including with an old binary.
+"$installer" "${dedup_args[@]}" --binary "$old_binary" >/dev/null
+[[ ! -e "$MOCK_SYSTEMCTL_ACTIVE.dedup" ]]
+grep -q '^ANYTLS_DEDUP_ENABLED=0$' "$ANYTLS_ENV_FILE"
+"$installer" "${dedup_args[@]}" --with-dedup >/dev/null
+[[ -f "$MOCK_SYSTEMCTL_ACTIVE.dedup" ]]
+# Menu switches reuse the transaction, preserve credentials and do not fetch.
+sha256sum "$ANYTLS_PASSWORD_FILE" >"$test_root/menu-password.sha"
+for enabled in 0 1; do
+  ANYTLS_INSTALLER_LIB_ONLY=1 bash -c '
+    installer=$1 enabled=$2
+    set --
+    source "$installer"
+    with_deployment_lock set_dedup_enabled "$enabled"
+  ' unused "$installer" "$enabled" >/dev/null
+  grep -q "^ANYTLS_DEDUP_ENABLED=$enabled$" "$ANYTLS_ENV_FILE"
+  sha256sum -c "$test_root/menu-password.sha" >/dev/null
+done
+
+snapshot_decoder_install() {
+  sha256sum "$ANYTLS_BIN_PATH" "$ANYTLS_ENV_FILE" "$ANYTLS_PASSWORD_FILE" "$ANYTLS_SYSTEMD_UNIT" \
+    "$ANYTLS_PROBE_BIN_PATH" "$ANYTLS_DEDUP_BIN_PATH" "$ANYTLS_DEDUP_SYSTEMD_UNIT" "$ANYTLS_CONFIG_DIR/dedup.env"
+}
+expect_decoder_failure() {
+  snapshot_decoder_install >"$test_root/before.sha"
+  if "$installer" "${dedup_args[@]}" "$@" >"$test_root/expected-failure.log" 2>&1; then
+    echo "expected decoder deployment failure: $*" >&2
+    exit 1
+  fi
+  snapshot_decoder_install >"$test_root/after.sha"
+  cmp "$test_root/before.sha" "$test_root/after.sha"
+  [[ -f "$MOCK_SYSTEMCTL_ACTIVE" && -f "$MOCK_SYSTEMCTL_ACTIVE.dedup" && -f "$MOCK_SYSTEMCTL_ENABLED.dedup" ]]
+}
+expect_decoder_failure --with-dedup --without-dedup
+expect_decoder_failure --binary "$old_binary"
+for injected in "$MOCK_DEDUP_FAIL_RESTART_ONCE" "$MOCK_DEDUP_HEALTH_FAIL" "$MOCK_DEDUP_PROBE_FAIL" "$MOCK_DEDUP_EPOCH_MISMATCH" "$MOCK_CP_FAIL"; do
+  touch "$injected"
+  expect_decoder_failure
+  rm -f "$injected"
+done
+printf '%s' 'anytls-dedup.new' >"$MOCK_INSTALL_FAIL_MATCH_FILE"
+expect_decoder_failure
+rm -f "$MOCK_INSTALL_FAIL_MATCH_FILE"
+touch "$MOCK_DEDUP_FAIL_STOP_ONCE"
+expect_decoder_failure --without-dedup
+# Restoring a main unit's Wants= must not change a stopped decoder's state.
+for original_active in 0 1; do
+  for original_enabled in 0 1; do
+    rm -f "$MOCK_SYSTEMCTL_ACTIVE.dedup" "$MOCK_SYSTEMCTL_ENABLED.dedup"
+    [[ "$original_active" == 0 ]] || touch "$MOCK_SYSTEMCTL_ACTIVE.dedup"
+    [[ "$original_enabled" == 0 ]] || touch "$MOCK_SYSTEMCTL_ENABLED.dedup"
+    snapshot_decoder_install >"$test_root/before.sha"
+    touch "$MOCK_DEDUP_HEALTH_FAIL"
+    if "$installer" "${dedup_args[@]}" >"$test_root/expected-failure.log" 2>&1; then exit 1; fi
+    rm -f "$MOCK_DEDUP_HEALTH_FAIL"
+    snapshot_decoder_install >"$test_root/after.sha"
+    cmp "$test_root/before.sha" "$test_root/after.sha"
+    if [[ "$original_active" == 1 ]]; then [[ -f "$MOCK_SYSTEMCTL_ACTIVE.dedup" ]]; else [[ ! -e "$MOCK_SYSTEMCTL_ACTIVE.dedup" ]]; fi
+    if [[ "$original_enabled" == 1 ]]; then [[ -f "$MOCK_SYSTEMCTL_ENABLED.dedup" ]]; else [[ ! -e "$MOCK_SYSTEMCTL_ENABLED.dedup" ]]; fi
+  done
+done
+touch "$MOCK_SYSTEMCTL_ACTIVE.dedup" "$MOCK_SYSTEMCTL_ENABLED.dedup"
+printf '%s\n' 123 >"$ANYTLS_CGROUP_ROOT/mock/memory.max"
+expect_decoder_failure
+printf '%s\n' 524288000 >"$ANYTLS_CGROUP_ROOT/mock/memory.max"
+# Missing state migrates to enabled, while a custom unmanaged backend is rejected.
+sed -i '/^ANYTLS_DEDUP_ENABLED=/d; /^ANYTLS_DEDUP_BACKEND=/d' "$ANYTLS_ENV_FILE"
+"$installer" "${dedup_args[@]}" >/dev/null
+grep -q '^ANYTLS_DEDUP_ENABLED=1$' "$ANYTLS_ENV_FILE"
+cp "$ANYTLS_CONFIG_DIR/dedup.env" "$test_root/good-dedup.env"
+sed -i "s/^ANYTLS_DEDUP_DOMAINS=.*/ANYTLS_DEDUP_DOMAINS=''/" "$ANYTLS_CONFIG_DIR/dedup.env"
+expect_decoder_failure
+cp "$test_root/good-dedup.env" "$ANYTLS_CONFIG_DIR/dedup.env"
+mkdir -p "$(dirname "$ANYTLS_DEDUP_RUNTIME_DIR")"
+printf unsafe >"$ANYTLS_DEDUP_RUNTIME_DIR"
+expect_decoder_failure
+[[ "$(cat "$ANYTLS_DEDUP_RUNTIME_DIR")" == unsafe ]]
+rm "$ANYTLS_DEDUP_RUNTIME_DIR"
+"$installer" uninstall --non-interactive >/dev/null
+[[ ! -e "$ANYTLS_DEDUP_BIN_PATH" && ! -e "$ANYTLS_DEDUP_SYSTEMD_UNIT" && ! -e "$ANYTLS_PROBE_BIN_PATH" ]]
+[[ ! -e "$MOCK_SYSTEMCTL_ACTIVE.dedup" && ! -e "$MOCK_SYSTEMCTL_ENABLED.dedup" ]]
+"$installer" uninstall --non-interactive >/dev/null
+# A missing unit/config after an earlier cleanup does not prevent retry.
+echo 'decoder default installation, opt-out, migration and rollback tests passed'
+
 original_repo_root="$repo_root"
 git_remote="$test_root/git-remote.git"
 git_seed="$test_root/git-seed"
@@ -361,8 +551,9 @@ update_remote="$test_root/update-remote.git"
 update_checkout="$test_root/update-checkout"
 update_candidate="$test_root/update-candidate"
 mkdir -p "$update_seed"
-cp -a "$original_repo_root/." "$update_seed/"
-rm -rf "$update_seed/.git"
+for source in AGENTS.md .gitignore cmd proxy util scripts docs go.mod go.sum readme.md; do
+  cp -a "$original_repo_root/$source" "$update_seed/"
+done
 git -C "$update_seed" init -q
 git -C "$update_seed" config user.name test
 git -C "$update_seed" config user.email test@example.com
@@ -396,6 +587,14 @@ rm -f "$update_checkout/update-interference"
 cmp -s "$old_binary" "$ANYTLS_BIN_PATH"
 [[ -f "$MOCK_SYSTEMCTL_ACTIVE" ]]
 
+export MOCK_GIT_INTERRUPT_ROOT="$update_checkout"
+if "$update_installer" update --non-interactive --no-firewall >"$test_root/interrupted-update.log" 2>&1; then
+  echo 'interruption after source advancement should roll back' >&2
+  exit 1
+fi
+unset MOCK_GIT_INTERRUPT_ROOT
+[[ "$(git -C "$update_checkout" rev-parse HEAD)" == "$baseline_commit" ]]
+cmp -s "$old_binary" "$ANYTLS_BIN_PATH"
 "$update_installer" update --non-interactive --no-firewall >/dev/null
 [[ "$(git -C "$update_checkout" rev-parse HEAD)" == "$candidate_commit" ]]
 if cmp -s "$old_binary" "$ANYTLS_BIN_PATH"; then
@@ -417,3 +616,105 @@ ANYTLS_BOOTSTRAP_LIB_ONLY=1 bash -c '
 '
 
 echo "bootstrap validation tests passed"
+
+ANYTLS_BOOTSTRAP_LIB_ONLY=1 bash -c '
+  bootstrap_script=$1
+  set -- menu --no-firewall
+  source "$bootstrap_script"
+  bootstrap_main() { printf "%s\n" "${installer_args[@]}"; }
+  bootstrap_menu_action 7
+' unused "$script_dir/bootstrap-anytls-server.sh" >"$test_root/menu-options.log"
+grep -qx -- --no-firewall "$test_root/menu-options.log"
+grep -qx -- --with-dedup "$test_root/menu-options.log"
+
+# Prove a bootstrap upgrade never executes the obsolete local installer.
+bootstrap_remote="$test_root/bootstrap-remote.git"
+bootstrap_seed="$test_root/bootstrap-seed"
+bootstrap_checkout="$test_root/bootstrap-checkout"
+mkdir -p "$bootstrap_seed"
+for source in AGENTS.md .gitignore cmd proxy util scripts docs go.mod go.sum readme.md; do
+  cp -a "$original_repo_root/$source" "$bootstrap_seed/"
+done
+git -C "$bootstrap_seed" init -q
+git -C "$bootstrap_seed" config user.name test
+git -C "$bootstrap_seed" config user.email test@example.com
+cp "$bootstrap_seed/scripts/install-anytls-server.sh" "$test_root/candidate-installer"
+printf '#!/usr/bin/env bash\necho "obsolete installer was executed" >&2\nexit 66\n' >"$bootstrap_seed/scripts/install-anytls-server.sh"
+git -C "$bootstrap_seed" add -A
+git -C "$bootstrap_seed" commit -qm obsolete-installer
+git -C "$bootstrap_seed" branch -M zji-dev
+bootstrap_old_commit="$(git -C "$bootstrap_seed" rev-parse HEAD)"
+git init --bare -q "$bootstrap_remote"
+git -C "$bootstrap_seed" remote add origin "$bootstrap_remote"
+git -C "$bootstrap_seed" push -q -u origin zji-dev
+git clone -q --branch zji-dev "$bootstrap_remote" "$bootstrap_checkout"
+cp "$test_root/candidate-installer" "$bootstrap_seed/scripts/install-anytls-server.sh"
+git -C "$bootstrap_seed" add scripts/install-anytls-server.sh
+git -C "$bootstrap_seed" commit -qm candidate-installer
+git -C "$bootstrap_seed" push -q
+bootstrap_new_commit="$(git -C "$bootstrap_seed" rev-parse HEAD)"
+"$installer" "${install_args[@]}" --binary "$old_binary" >/dev/null
+sed -i '/^ANYTLS_DEDUP_ENABLED=/d; /^ANYTLS_DEDUP_BACKEND=/d' "$ANYTLS_ENV_FILE"
+cp "$ANYTLS_ENV_FILE" "$test_root/legacy.env"
+# Use the latest downloaded entry, overriding only package/toolchain installation
+# so the test never changes the host OS. Git, candidate handoff and transactions run.
+run_bootstrap_fixture() {
+  ANYTLS_REPO_URL="$bootstrap_remote" ANYTLS_SRC_DIR="$bootstrap_checkout" \
+    ANYTLS_BOOTSTRAP_LIB_ONLY=1 bash -c '
+      bootstrap_script=$1
+      bootstrap_action=$2
+      set -- "$bootstrap_action" --non-interactive --no-firewall
+      source "$bootstrap_script"
+      install_packages() { :; }
+      ensure_go() { :; }
+      # Exercise the downloaded menu dispatch without requiring a terminal.
+      bootstrap_menu() { bootstrap_menu_action 2; }
+      bootstrap_main
+    ' unused "$script_dir/bootstrap-anytls-server.sh" "${1:-update}"
+}
+touch "$MOCK_DEDUP_PROBE_FAIL"
+if run_bootstrap_fixture >"$test_root/bootstrap-failure.log" 2>&1; then
+  echo 'legacy bootstrap upgrade should fail and roll back on decoder probe failure' >&2
+  exit 1
+fi
+rm -f "$MOCK_DEDUP_PROBE_FAIL"
+[[ "$(git -C "$bootstrap_checkout" rev-parse HEAD)" == "$bootstrap_old_commit" ]]
+cmp "$test_root/legacy.env" "$ANYTLS_ENV_FILE"
+cmp "$old_binary" "$ANYTLS_BIN_PATH"
+[[ ! -e "$ANYTLS_DEDUP_BIN_PATH" && ! -e "$ANYTLS_DEDUP_SYSTEMD_UNIT" ]]
+export MOCK_GIT_FAIL_FETCH_ROOT="$bootstrap_checkout"
+if run_bootstrap_fixture menu >"$test_root/bootstrap-fetch-failure.log" 2>&1; then
+  echo 'menu upgrade should fail before deployment when fetch fails' >&2
+  exit 1
+fi
+unset MOCK_GIT_FAIL_FETCH_ROOT
+grep -q 'injected fetch failure' "$test_root/bootstrap-fetch-failure.log"
+[[ "$(git -C "$bootstrap_checkout" rev-parse HEAD)" == "$bootstrap_old_commit" ]]
+cmp "$test_root/legacy.env" "$ANYTLS_ENV_FILE"
+cmp "$old_binary" "$ANYTLS_BIN_PATH"
+[[ ! -e "$ANYTLS_DEDUP_BIN_PATH" && ! -e "$ANYTLS_DEDUP_SYSTEMD_UNIT" ]]
+run_bootstrap_fixture menu >"$test_root/bootstrap-success.log" 2>&1
+[[ "$(git -C "$bootstrap_checkout" rev-parse HEAD)" == "$bootstrap_new_commit" ]]
+grep -q '^ANYTLS_DEDUP_ENABLED=1$' "$ANYTLS_ENV_FILE"
+[[ -f "$MOCK_SYSTEMCTL_ACTIVE.dedup" && -f "$MOCK_SYSTEMCTL_ACTIVE" ]]
+[[ "$(git -C "$bootstrap_checkout" worktree list --porcelain | rg -c '^worktree ')" == 1 ]]
+"$installer" uninstall --non-interactive >/dev/null
+echo 'legacy bootstrap menu/update decoder migration and rollback tests passed'
+
+# Both omitted and explicit menu actions stay in the downloaded entry. Merely
+# opening the menu must neither fetch source nor execute an obsolete installer.
+for menu_action in default menu; do
+  ANYTLS_REPO_URL="$bootstrap_remote" ANYTLS_SRC_DIR="$bootstrap_checkout" \
+    ANYTLS_BOOTSTRAP_LIB_ONLY=1 bash -c '
+      bootstrap_script=$1 menu_action=$2
+      set --
+      [[ "$menu_action" == default ]] || set -- menu
+      source "$bootstrap_script"
+      install_packages() { :; }
+      ensure_go() { echo "menu unexpectedly installed Go" >&2; exit 1; }
+      bootstrap_menu() { echo downloaded-menu; }
+      bootstrap_main
+    ' unused "$script_dir/bootstrap-anytls-server.sh" "$menu_action" >"$test_root/menu.log"
+  grep -qx downloaded-menu "$test_root/menu.log"
+done
+echo 'bootstrap default and explicit menu entry tests passed'

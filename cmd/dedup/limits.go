@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log"
 	"net"
@@ -16,7 +17,7 @@ import (
 )
 
 // bind binds host:port, shareable with a successor instance on Linux, or
-// unix:/path. A unix socket is replaced, and not removed on close, so a
+// unix:/path. A same-UID unix socket is replaced, and not removed on close, so a
 // draining instance does not delete its successor's socket.
 func bind(address string) (net.Listener, error) {
 	path, ok := strings.CutPrefix(address, "unix:")
@@ -24,13 +25,37 @@ func bind(address string) (net.Listener, error) {
 		lc := net.ListenConfig{Control: reusePort}
 		return lc.Listen(context.Background(), "tcp", address)
 	}
-	os.Remove(path)
+	if err := removeExistingSocket(path, os.Geteuid()); err != nil {
+		return nil, err
+	}
 	ln, err := net.Listen("unix", path)
 	if err != nil {
 		return nil, err
 	}
 	ln.(*net.UnixListener).SetUnlinkOnClose(false)
 	return ln, nil
+}
+
+// The installer must control access to the parent directory: these path-based
+// checks and unlink are not atomic against concurrent directory mutations.
+func removeExistingSocket(path string, uid int) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect unix socket %q: %w", path, err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("refuse to replace non-socket %q", path)
+	}
+	if err := checkSocketOwner(info, uid); err != nil {
+		return fmt.Errorf("refuse to replace unix socket %q: %w", path, err)
+	}
+	if err := os.Remove(path); err != nil {
+		return fmt.Errorf("remove unix socket %q: %w", path, err)
+	}
+	return nil
 }
 
 // untilSignal blocks until SIGTERM or an interrupt, then runs drain with a

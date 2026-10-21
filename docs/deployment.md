@@ -13,7 +13,7 @@
 
 更完整的状态、验证结果和限制见 [zji-dev 当前状态](./status.md)。
 
-去重解码端的默认安装、推荐配置与旧版升级流程见 [安装设计草案](./dedup-installation-design.md)；该默认行为尚未实现。
+默认同时安装请求去重解码端；新装和没有去重设置的旧版升级都会开启，明确关闭过的安装保留关闭状态。推荐配置、旧版迁移和验收步骤见 [去重解码端安装](./dedup-installation-design.md)。服务端就绪后，客户端仍需自行配置前端、CA 信任和设备名单才能实际去重。
 
 ## 推荐一键安装
 
@@ -95,6 +95,7 @@ sudo ./scripts/install-anytls-server.sh -p '你的密码' -l 0.0.0.0:8443 -s you
 - `--binary`：使用已有 `anytls-server` 二进制，服务端不再现场编译，但仍会构建临时 probe client。
 - `--padding-scheme`：可选，安装自定义 PaddingScheme 文件。
 - `--no-firewall`：不自动修改本机防火墙规则。
+- `--with-dedup` / `--without-dedup`：开启 / 关闭请求去重解码端，互斥；未指定时保留保存状态，无保存状态则开启。
 - `--non-interactive`：不提示输入；未传密码时自动生成随机密码。
 
 交互安装时可在 fallback 提示中输入 `none` 或 `off` 禁用；非交互安装使用 `--fallback ''`。
@@ -105,6 +106,10 @@ sudo ./scripts/install-anytls-server.sh -p '你的密码' -l 0.0.0.0:8443 -s you
 - `/etc/anytls/server.env`
 - `/etc/anytls/server.password`
 - `/etc/systemd/system/anytls-server.service`
+- `/usr/local/bin/anytls-dedup`、`/etc/anytls/dedup.env` 和 `/etc/systemd/system/anytls-dedup.service`（开启解码端时）。
+- `/usr/local/libexec/anytls-health-probe`（普通链路与解码链路自检）。
+
+解码器使用独立系统用户及本机 Unix socket，默认缓存 256 MiB、Go 软内存上限 448 MiB、systemd 硬上限 500 MiB；内存明显不足会在切换前失败，可用 `--without-dedup` 关闭。它不新增公网监听端口，崩溃不会连带停止 AnyTLS 主服务。
 
 服务默认使用专用的 `anytls` 系统用户运行。密码单独保存在 `server.password`，不会写入 systemd 的 `ExecStart` 参数或非敏感环境文件；配置目录仅允许 root 和 `anytls` 组读取。监听 443 等低端口时只授予 `CAP_NET_BIND_SERVICE`，不会以 root 身份运行服务。
 
@@ -130,6 +135,17 @@ sudo journalctl -u anytls-server -f
 - 自检服务状态、二进制、配置、监听端口和 fallback 目标。
 - 重启服务。
 - 卸载服务和配置。
+- 开启 / 关闭去重解码端（复用安装事务，保留密码与连接设置）。
+
+已有旧版安装时，首次升级应使用最新 bootstrap，以便由新版协调器同时管理主服务与解码端；直接运行旧目录中的安装器不能保证完成迁移：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bootstrap-anytls-server.sh \
+  | sudo bash -s -- update --non-interactive --no-firewall
+sudo /opt/anytls-go/scripts/install-anytls-server.sh doctor
+```
+
+无参数运行最新 bootstrap 后选择安装或更新，也走同一候选协调器。启用期间会重启主服务，现有连接会短暂中断。首次安装或升级完成只表示解码服务就绪，实际业务和去重收益应从客户端另行验证。
 
 更新操作先把远端提交放入临时 Git worktree，只生成候选 staging。当前安装器持有旧服务备份，候选服务通过 MainPID 稳定检查、真实 TLS/认证/开流/代理数据往返和 `doctor` 后，主源码目录才会快进并提交服务事务。源码推进失败也会恢复旧服务。存在已跟踪、未跟踪或暂存修改、分支不一致或历史分叉时会拒绝自动更新。
 

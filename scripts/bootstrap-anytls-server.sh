@@ -207,6 +207,52 @@ PY
   trap - EXIT
 }
 
+# Keep this menu in the downloaded bootstrap: an old checkout's menu must
+# never coordinate an install/update of a newer staging format.
+# shellcheck disable=SC2030
+bootstrap_menu_action() (
+  case "$1" in
+    1) installer_args=(install "${installer_args[@]:1}") ;;
+    2) installer_args=(update "${installer_args[@]:1}") ;;
+    3) installer_args=(status) ;;
+    4) installer_args=(doctor) ;;
+    5) installer_args=(restart) ;;
+    6) installer_args=(uninstall) ;;
+    7) installer_args=(update "${installer_args[@]:1}" --with-dedup --non-interactive) ;;
+    8) installer_args=(update "${installer_args[@]:1}" --without-dedup --non-interactive) ;;
+    *) echo 'invalid choice' >&2; return 2 ;;
+  esac
+  # The parent menu catches failures with ||. A fresh Bash keeps errexit
+  # effective inside package/toolchain setup, fetch and worktree creation.
+  export repo_url branch install_dir go_version
+  export -f detect_arch validate_install_dir validate_inputs normalize_repo_url \
+    install_packages ensure_go bootstrap_main bootstrap_menu bootstrap_menu_action
+  bash -euo pipefail -c 'installer_args=("$@"); bootstrap_main' anytls-bootstrap "${installer_args[@]}"
+)
+
+bootstrap_menu() {
+  local choice
+  while true; do
+    echo
+    echo 'AnyTLS Server Manager'
+    echo '1) Install / Reinstall'
+    echo "2) Update $branch and restart"
+    echo '3) Status and client URI'
+    echo '4) Doctor / self-check'
+    echo '5) Restart'
+    echo '6) Uninstall'
+    echo '7) Enable request deduplication decoder'
+    echo '8) Disable request deduplication decoder'
+    echo '0) Exit'
+    read -r -p 'Select [1]: ' choice </dev/tty || return 1
+    choice="${choice:-1}"
+    [[ "$choice" != 0 ]] || return 0
+    bootstrap_menu_action "$choice" || echo 'action failed; see the error above' >&2
+    # Uninstall can also remove the managed checkout.
+    [[ -d "$install_dir/.git" ]] || return 0
+  done
+}
+
 bootstrap_main() {
   if [[ "$(id -u)" -ne 0 ]]; then
     echo "please run as root, for example: sudo bash bootstrap-anytls-server.sh" >&2
@@ -217,7 +263,18 @@ bootstrap_main() {
   install_packages
   validate_inputs
 
+  # The menu passes its subshell-local array to a fresh Bash as positional args.
+  # shellcheck disable=SC2031
   local existing_checkout=0 requested_action="${installer_args[0]:-menu}" required_go=""
+  # Hold the same lock through fetch, candidate deployment, source commit and cleanup.
+  local bootstrap_lock_fd
+  if [[ "$requested_action" == install || "$requested_action" == update ]]; then
+    local lock_file="${ANYTLS_DEPLOYMENT_LOCK_FILE:-/run/lock/${ANYTLS_SERVICE_NAME:-anytls-server}.install.lock}"
+    install -d -m 0755 "$(dirname "$lock_file")"
+    exec {bootstrap_lock_fd}>"$lock_file"
+    flock -n "$bootstrap_lock_fd" || { echo 'another AnyTLS deployment is already running' >&2; return 75; }
+    export ANYTLS_DEPLOYMENT_LOCK_HELD=1
+  fi
   if [[ -d "$install_dir/.git" ]]; then
     existing_checkout=1
     local existing_repo_url current_branch
@@ -275,6 +332,26 @@ bootstrap_main() {
     )
   elif [[ "$requested_action" == "install" ]]; then
     installer_args[0]="update"
+  fi
+
+  if [[ "$existing_checkout" == 1 && ( "$requested_action" == install || "$requested_action" == update ) ]]; then
+    local candidate_commit deploy_status=0
+    candidate_commit="$(git -C "$install_dir" rev-parse "origin/$branch")"
+    bootstrap_candidate_worktree="$(mktemp -d)"
+    rmdir "$bootstrap_candidate_worktree"
+    git -C "$install_dir" worktree add --detach "$bootstrap_candidate_worktree" "$candidate_commit"
+    trap 'git -C "$install_dir" worktree remove --force "$bootstrap_candidate_worktree" >/dev/null 2>&1 || true' EXIT
+    echo 'starting candidate-version installer (source checkout commits only after health checks)...'
+    ANYTLS_UPDATE_REPO_ROOT="$install_dir" ANYTLS_UPDATE_COMMIT="$candidate_commit" \
+      bash "$bootstrap_candidate_worktree/scripts/install-anytls-server.sh" "${installer_args[@]}" --branch "$branch" || deploy_status=$?
+    git -C "$install_dir" worktree remove --force "$bootstrap_candidate_worktree" >/dev/null 2>&1 || true
+    trap - EXIT
+    return "$deploy_status"
+  fi
+
+  if [[ "$existing_checkout" == 1 && "$requested_action" == menu ]]; then
+    bootstrap_menu
+    return
   fi
 
   echo

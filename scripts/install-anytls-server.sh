@@ -9,9 +9,15 @@ env_file="${ANYTLS_ENV_FILE:-$config_dir/server.env}"
 password_file="${ANYTLS_PASSWORD_FILE:-$config_dir/server.password}"
 firewall_state_file="${ANYTLS_FIREWALL_STATE_FILE:-$config_dir/firewall.state}"
 bin_path="${ANYTLS_BIN_PATH:-/usr/local/bin/anytls-server}"
+probe_path="${ANYTLS_PROBE_BIN_PATH:-/usr/local/libexec/anytls-health-probe}"
 systemd_unit="${ANYTLS_SYSTEMD_UNIT:-/etc/systemd/system/${service_name}.service}"
 deployment_lock_file="${ANYTLS_DEPLOYMENT_LOCK_FILE:-/run/lock/${service_name}.install.lock}"
 default_branch="zji-dev"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source_root="$(cd -- "$script_dir/.." && pwd)"
+repo_root="${ANYTLS_UPDATE_REPO_ROOT:-$source_root}"
+# shellcheck source=scripts/install-dedup.sh
+source "$script_dir/install-dedup.sh"
 
 transaction_dir=""
 transaction_active=0
@@ -45,6 +51,8 @@ Options for install/update:
       --branch BRANCH           Expected source branch. Default: zji-dev
       --binary FILE             Existing server binary; Go still builds the health probe.
       --padding-scheme FILE     Optional PaddingScheme file.
+      --with-dedup              Enable the recommended decoder (default for new/legacy installs).
+      --without-dedup           Disable decoder; later upgrades preserve this choice.
       --no-firewall             Do not modify local firewall rules.
       --non-interactive         Do not prompt; generate a password if missing.
   -h, --help                    Show this help.
@@ -54,7 +62,6 @@ USAGE
 action="menu"
 listen_addr=""
 password=""
-password_arg_set=0
 server_name=""
 fallback_addr="127.0.0.1:80"
 padding_scheme=""
@@ -80,12 +87,12 @@ require_option_value() {
   fi
 }
 
+installer_cli_options=("$@")
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -p|--password)
       require_option_value "$@"
       password="$2"
-      password_arg_set=1
       shift 2
       ;;
     -l|--listen)
@@ -121,6 +128,14 @@ while [[ $# -gt 0 ]]; do
       require_option_value "$@"
       expected_branch="$2"
       shift 2
+      ;;
+    --with-dedup)
+      dedup_option 1 || exit 2
+      shift
+      ;;
+    --without-dedup)
+      dedup_option 0 || exit 2
+      shift
       ;;
     --non-interactive)
       non_interactive=1
@@ -183,9 +198,6 @@ with_deployment_lock() {
   deployment_lock_fd=""
   return "$status"
 }
-
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd -- "$script_dir/.." && pwd)"
 
 env_quote() {
   printf "%s" "$1" | sed "s/'/'\\\\''/g; s/^/'/; s/$/'/"
@@ -293,6 +305,7 @@ load_existing_defaults() {
   if [[ "$fallback_arg_set" -eq 0 ]] && env_key_exists ANYTLS_FALLBACK; then
     fallback_addr="$existing_fallback"
   fi
+  dedup_load_defaults "${1:-deploy}" || return 1
 }
 
 collect_install_inputs() {
@@ -315,6 +328,15 @@ collect_install_inputs() {
   server_name="$(prompt_default "Server IP/domain for client URI" "${server_name:-YOUR_SERVER_IP}")" || return 1
   fallback_addr="$(prompt_default "Fallback address (type 'none' to disable)" "${fallback_addr:-127.0.0.1:80}")" || return 1
   [[ "$fallback_addr" == "none" || "$fallback_addr" == "off" ]] && fallback_addr=""
+  if [[ -z "$dedup_requested" ]]; then
+    local dedup_default=n
+    [[ "$dedup_enabled" == 1 ]] && dedup_default=y
+    if prompt_yes_no "Install request deduplication decoder (recommended)?" "$dedup_default"; then
+      dedup_enabled=1
+    else
+      dedup_enabled=0
+    fi
+  fi
   if [[ -z "$padding_scheme" ]] && prompt_yes_no "Use custom PaddingScheme file?" "n"; then
     padding_scheme="$(prompt_default "PaddingScheme file path" "")" || return 1
   fi
@@ -366,6 +388,7 @@ validate_inputs() {
     echo "binary not found: $binary_path" >&2
     return 1
   fi
+  dedup_preflight || return 1
   if [[ -z "$expected_branch" || "$expected_branch" == -* ]]; then
     echo "invalid branch name: $expected_branch" >&2
     return 1
@@ -422,10 +445,10 @@ run_candidate_tests() {
   fi
   echo "downloading Go modules and running candidate tests..."
   if ! (
-    cd "$repo_root" &&
+    cd "$source_root" &&
       go mod download &&
       go test ./... &&
-      bash -n scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh scripts/test-installation.sh &&
+      bash -n scripts/install-anytls-server.sh scripts/install-dedup.sh scripts/bootstrap-anytls-server.sh scripts/test-installation.sh &&
       ANYTLS_DEPLOYMENT_LOCK_HELD=0 ANYTLS_SKIP_CANDIDATE_TESTS=1 bash scripts/test-installation.sh
   ); then
     return 1
@@ -451,9 +474,10 @@ build_staged_binaries() {
   run_candidate_tests || return 1
   echo "building AnyTLS candidates from $repo_root..."
   if [[ -z "$binary_path" ]]; then
-    (cd "$repo_root" && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$stage_dir/anytls-server" ./cmd/server) || return 1
+    (cd "$source_root" && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$stage_dir/anytls-server" ./cmd/server) || return 1
   fi
-  (cd "$repo_root" && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$stage_dir/anytls-client" ./cmd/client) || return 1
+  (cd "$source_root" && CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o "$stage_dir/anytls-client" ./cmd/client) || return 1
+  dedup_build "$stage_dir" || return 1
 }
 
 write_staged_files() {
@@ -508,7 +532,7 @@ ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
-RestrictAddressFamilies=AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=true
 LockPersonality=true
 SystemCallArchitectures=native
@@ -520,6 +544,26 @@ EOF
     return 1
   fi
   chmod 0644 "$stage_dir/${service_name}.service" || return 1
+  if [[ "$dedup_enabled" == 1 ]]; then
+    sed -i "/^After=network-online.target/a After=$dedup_service_name.service\nWants=$dedup_service_name.service" "$stage_dir/${service_name}.service" || return 1
+  fi
+  dedup_write_staged "$stage_dir" || return 1
+}
+
+
+verify_staged_units() {
+  local stage_dir="$1" validation_dir="$1/unit-check" unit
+  command -v systemd-analyze >/dev/null 2>&1 || { echo 'systemd-analyze is required to validate service units' >&2; return 1; }
+  mkdir -p "$validation_dir" || return 1
+  for unit in "$stage_dir/"*.service; do
+    cp "$unit" "$validation_dir/" || return 1
+  done
+  sed -i "s|^ExecStart=.*|ExecStart=$stage_dir/anytls-server|" "$validation_dir/$service_name.service" || return 1
+  if [[ "$dedup_enabled" == 1 ]]; then
+    sed -i "s|^ExecStart=[^ ]*|ExecStart=$stage_dir/anytls-dedup|" "$validation_dir/$dedup_service_name.service" || return 1
+  fi
+  SYSTEMD_UNIT_PATH="$validation_dir:/usr/local/lib/systemd/system:/usr/lib/systemd/system:/lib/systemd/system" \
+    systemd-analyze --man=no verify "$validation_dir/"*.service
 }
 
 backup_path() {
@@ -576,11 +620,13 @@ begin_install_transaction() {
   fi
 
   backup_path "$bin_path" binary || return 1
+  backup_path "$probe_path" probe_binary || return 1
   backup_path "$env_file" environment || return 1
   backup_path "$password_file" password || return 1
   backup_path "$config_dir/padding.txt" padding || return 1
   backup_path "$config_dir/user.managed" user_managed || return 1
   backup_path "$systemd_unit" unit || return 1
+  dedup_backup || return 1
   transaction_active=1
   trap 'transaction_exit $?' EXIT
   trap 'exit 130' INT
@@ -597,11 +643,13 @@ rollback_install() {
   transaction_active=0
   local rollback_failed=0
   restore_path "$bin_path" binary || rollback_failed=1
+  restore_path "$probe_path" probe_binary || rollback_failed=1
   restore_path "$env_file" environment || rollback_failed=1
   restore_path "$password_file" password || rollback_failed=1
   restore_path "$config_dir/padding.txt" padding || rollback_failed=1
   restore_path "$config_dir/user.managed" user_managed || rollback_failed=1
   restore_path "$systemd_unit" unit || rollback_failed=1
+  dedup_restore_files || rollback_failed=1
   if [[ "$config_dir_existed" -eq 1 ]]; then
     if [[ -n "$config_dir_metadata" ]]; then
       chown "${config_dir_metadata%% *}" "$config_dir" || rollback_failed=1
@@ -611,6 +659,7 @@ rollback_install() {
     rm -rf "$config_dir" || rollback_failed=1
   fi
   systemctl daemon-reload >/dev/null 2>&1 || rollback_failed=1
+  dedup_restore_state || rollback_failed=1
   if [[ "$service_was_enabled" -eq 1 ]]; then
     systemctl enable "$service_name" >/dev/null 2>&1 || rollback_failed=1
   else
@@ -623,6 +672,8 @@ rollback_install() {
   else
     systemctl stop "$service_name" >/dev/null 2>&1 || true
   fi
+  dedup_finalize_restore_state || rollback_failed=1
+  rollback_source_tree || rollback_failed=1
   if [[ "${service_user_created:-0}" -eq 1 ]]; then
     if ! userdel "$service_user" >/dev/null 2>&1 && ! deluser "$service_user" >/dev/null 2>&1; then
       rollback_failed=1
@@ -636,11 +687,12 @@ rollback_install() {
 }
 
 wait_for_service_stable() {
+  local target_service="${1:-$service_name}"
   local main_pid current_pid
   main_pid=""
   for _ in {1..20}; do
-    if systemctl is-active "$service_name" >/dev/null 2>&1; then
-      current_pid="$(systemctl show --property MainPID --value "$service_name" 2>/dev/null || true)"
+    if systemctl is-active "$target_service" >/dev/null 2>&1; then
+      current_pid="$(systemctl show --property MainPID --value "$target_service" 2>/dev/null || true)"
       if [[ "$current_pid" =~ ^[1-9][0-9]*$ ]]; then
         if [[ -z "$main_pid" ]]; then
           main_pid="$current_pid"
@@ -655,8 +707,8 @@ wait_for_service_stable() {
 
   if [[ -n "$main_pid" ]]; then
     for _ in {1..12}; do
-      current_pid="$(systemctl show --property MainPID --value "$service_name" 2>/dev/null || true)"
-      if ! systemctl is-active "$service_name" >/dev/null 2>&1 || [[ "$current_pid" != "$main_pid" ]]; then
+      current_pid="$(systemctl show --property MainPID --value "$target_service" 2>/dev/null || true)"
+      if ! systemctl is-active "$target_service" >/dev/null 2>&1 || [[ "$current_pid" != "$main_pid" ]]; then
         main_pid=""
         break
       fi
@@ -666,8 +718,8 @@ wait_for_service_stable() {
   if [[ -n "$main_pid" ]]; then
     return 0
   fi
-  systemctl --no-pager --full status "$service_name" >&2 || true
-  journalctl -u "$service_name" -n 30 --no-pager >&2 2>/dev/null || true
+  systemctl --no-pager --full status "$target_service" >&2 || true
+  journalctl -u "$target_service" -n 30 --no-pager >&2 2>/dev/null || true
   return 1
 }
 
@@ -692,7 +744,9 @@ atomic_install() {
 apply_staged_install() {
   local stage_dir="$1"
   install -d -o root -g "$service_group" -m 0750 "$config_dir" || return 1
+  install -d -m 0755 "$(dirname "$probe_path")" || return 1
   atomic_install "$stage_dir/anytls-server" "$bin_path" root root 0755 || return 1
+  atomic_install "$stage_dir/anytls-client" "$probe_path" root root 0755 || return 1
   atomic_install "$stage_dir/server.env" "$env_file" root "$service_group" 0640 || return 1
   atomic_install "$stage_dir/server.password" "$password_file" root "$service_group" 0640 || return 1
   if [[ -f "$stage_dir/padding.txt" ]]; then
@@ -707,6 +761,7 @@ apply_staged_install() {
     chmod 0600 "$config_dir/user.managed" || return 1
   fi
 
+  dedup_apply "$stage_dir" || return 1
   if ! systemctl daemon-reload || ! systemctl enable "$service_name" || ! systemctl restart "$service_name" || ! wait_for_service_stable; then
     return 1
   fi
@@ -910,6 +965,10 @@ print_summary() {
   echo
   echo "Client URI:"
   client_uri
+  dedup_status
+  if [[ "$dedup_enabled" == 1 ]]; then
+    echo 'Decoder is ready. Verify client discovery, business requests and actual dedup savings separately.'
+  fi
 }
 
 doctor_failure=0
@@ -975,7 +1034,7 @@ check_fallback() {
 
 run_doctor() {
   require_systemd
-  load_existing_defaults
+  load_existing_defaults read || return 1
   doctor_failure=0
   local current_port
   current_port="$(listen_port "$listen_addr" 2>/dev/null || true)"
@@ -1030,6 +1089,16 @@ run_doctor() {
   echo "Fallback:"
   check_fallback
   echo
+  echo "Dedup:"
+  dedup_doctor
+  if [[ "${ANYTLS_DOCTOR_SKIP_PROBE:-0}" != 1 ]]; then
+    if [[ -x "$probe_path" ]] && run_anytls_probe "$probe_path" && dedup_probe "$probe_path"; then
+      doctor_ok 'end-to-end AnyTLS and enabled decoder probes passed'
+    else
+      doctor_fail 'end-to-end AnyTLS or decoder probe failed'
+    fi
+  fi
+  echo
   echo "Client URI:"
   client_uri
   echo
@@ -1058,7 +1127,7 @@ install_or_update() {
   else
     stage_dir="$(mktemp -d)" || return 1
   fi
-  if ! build_staged_binaries "$stage_dir" || ! write_staged_files "$stage_dir"; then
+  if ! build_staged_binaries "$stage_dir" || ! write_staged_files "$stage_dir" || ! verify_staged_units "$stage_dir"; then
     [[ "$stage_owned" -eq 1 ]] && rm -rf "$stage_dir"
     return 1
   fi
@@ -1066,11 +1135,14 @@ install_or_update() {
     return
   fi
 
-  if ! ensure_service_user; then
+  if ! ensure_service_user || ! dedup_ensure_user; then
+    dedup_remove_created_user || true
+    remove_created_service_user
     rm -rf "$stage_dir"
     return 1
   fi
   if ! begin_install_transaction "$stage_dir"; then
+    dedup_remove_created_user || true
     remove_created_service_user
     rm -rf "$stage_dir"
     return 1
@@ -1084,7 +1156,7 @@ install_or_update() {
     transaction_dir=""
     return 1
   fi
-  if ! run_anytls_probe "$stage_dir/anytls-client" || ! ANYTLS_DOCTOR_SKIP_FIREWALL=1 run_doctor; then
+  if ! run_anytls_probe "$stage_dir/anytls-client" || ! dedup_probe "$stage_dir/anytls-client" || ! dedup_finish_apply || ! ANYTLS_DOCTOR_SKIP_FIREWALL=1 ANYTLS_DOCTOR_SKIP_PROBE=1 run_doctor; then
     if rollback_install; then
       rm -rf "$stage_dir"
     else
@@ -1101,7 +1173,7 @@ install_or_update() {
 }
 
 update_source_tree() {
-  if [[ ! -d "$repo_root/.git" ]]; then
+  if [[ ! -e "$repo_root/.git" ]]; then
     echo "source directory is not a Git checkout: $repo_root" >&2
     return 1
   fi
@@ -1123,59 +1195,56 @@ update_source_tree() {
   }
 }
 
+# Both bootstrap and direct updates run the candidate's coordinator, so old
+# installer functions never apply a newer staging format.
 do_update() {
   require_root
   require_systemd
-  load_existing_defaults
-  if [[ -z "$password" ]]; then
-    echo "no existing installation found; running install instead"
-    install_or_update
+  if [[ -n "${ANYTLS_UPDATE_COMMIT:-}" ]]; then
+    apply_candidate_update
     return
   fi
   update_source_tree || return 1
-  local target_commit current_commit worktree_dir
+  local target_commit current_commit worktree_dir update_status=0
   target_commit="$(git -C "$repo_root" rev-parse "origin/$expected_branch")" || return 1
   current_commit="$(git -C "$repo_root" rev-parse HEAD)" || return 1
-  if [[ "$target_commit" == "$current_commit" ]]; then
-    echo "source is already current; rebuilding installed service"
+  if [[ "$target_commit" == "$current_commit" && "$source_root" == "$repo_root" ]]; then
     install_or_update
     return
   fi
-
   worktree_dir="$(mktemp -d)" || return 1
   rmdir "$worktree_dir" || return 1
   git -C "$repo_root" worktree add --detach "$worktree_dir" "$target_commit" || return 1
-  local stage_dir
-  if ! stage_dir="$(mktemp -d)"; then
-    git -C "$repo_root" worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
+  ANYTLS_UPDATE_REPO_ROOT="$repo_root" ANYTLS_UPDATE_COMMIT="$target_commit" ANYTLS_DEPLOYMENT_LOCK_HELD=1 \
+    bash "$worktree_dir/scripts/install-anytls-server.sh" update "${original_options[@]}" || update_status=$?
+  git -C "$repo_root" worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
+  return "$update_status"
+}
+
+apply_candidate_update() {
+  local target_commit="$ANYTLS_UPDATE_COMMIT" current_commit stage_dir
+  current_commit="$(git -C "$repo_root" rev-parse HEAD)" || return 1
+  [[ "$(git -C "$source_root" rev-parse HEAD)" == "$target_commit" && \
+     "$(git -C "$repo_root" branch --show-current)" == "$expected_branch" && \
+     -z "$(git -C "$repo_root" status --porcelain)" ]] || return 1
+  git -C "$repo_root" merge-base --is-ancestor "$current_commit" "$target_commit" || return 1
+  collect_install_inputs && validate_inputs || return 1
+  stage_dir="$(mktemp -d)" || return 1
+  if ! build_staged_binaries "$stage_dir" || ! write_staged_files "$stage_dir" || ! verify_staged_units "$stage_dir"; then
+    rm -rf "$stage_dir"
     return 1
   fi
-  local -a staged_args=(install --non-interactive --listen "$listen_addr" --server-name "$server_name" --fallback "$fallback_addr" --branch "$expected_branch")
-  [[ "$password_arg_set" -eq 1 ]] && staged_args+=(--password "$password")
-  [[ "$auto_firewall" -eq 0 ]] && staged_args+=(--no-firewall)
-  [[ -n "$padding_scheme" ]] && staged_args+=(--padding-scheme "$padding_scheme")
-  [[ -n "$binary_path" ]] && staged_args+=(--binary "$binary_path")
-
-  local update_status=0
-  ANYTLS_UPDATE_STAGED=1 \
-    ANYTLS_STAGE_ONLY="$stage_dir" \
-    ANYTLS_DEPLOYMENT_LOCK_HELD=1 \
-    "$worktree_dir/scripts/install-anytls-server.sh" "${staged_args[@]}" || update_status=$?
-  git -C "$repo_root" worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
-  if [[ "$update_status" -ne 0 ]]; then
-    rm -rf "$stage_dir"
-    echo "candidate staging failed; service and source checkout were not changed" >&2
-    return "$update_status"
-  fi
-
-  if ! ensure_service_user || ! begin_install_transaction "$stage_dir"; then
+  if ! ensure_service_user || ! dedup_ensure_user || ! begin_install_transaction "$stage_dir"; then
+    dedup_remove_created_user || true
     remove_created_service_user
     rm -rf "$stage_dir"
     return 1
   fi
-  if ! apply_staged_install "$stage_dir" || \
-    ! run_anytls_probe "$stage_dir/anytls-client" || \
-    ! ANYTLS_DOCTOR_SKIP_FIREWALL=1 run_doctor; then
+  if ! apply_staged_install "$stage_dir" || ! run_anytls_probe "$stage_dir/anytls-client" || \
+     ! dedup_probe "$stage_dir/anytls-client" || ! dedup_finish_apply || \
+     ! ANYTLS_DOCTOR_SKIP_FIREWALL=1 ANYTLS_DOCTOR_SKIP_PROBE=1 run_doctor || \
+     [[ "$(git -C "$repo_root" rev-parse HEAD)" != "$current_commit" || -n "$(git -C "$repo_root" status --porcelain)" ]] || \
+     ! advance_source_tree "$current_commit" "$target_commit"; then
     if rollback_install; then
       rm -rf "$stage_dir"
     else
@@ -1184,19 +1253,6 @@ do_update() {
     transaction_dir=""
     return 1
   fi
-
-  if [[ "$(git -C "$repo_root" rev-parse HEAD)" != "$current_commit" || -n "$(git -C "$repo_root" status --porcelain)" ]] || \
-    ! git -C "$repo_root" merge --ff-only "$target_commit"; then
-    echo "source checkout changed while candidate was deploying; rolling service back" >&2
-    if rollback_install; then
-      rm -rf "$stage_dir"
-    else
-      echo "recovery files retained at $stage_dir/backup" >&2
-    fi
-    transaction_dir=""
-    return 1
-  fi
-
   commit_install_transaction
   reconcile_firewall "$(listen_port "$listen_addr")"
   rm -rf "$stage_dir"
@@ -1204,9 +1260,34 @@ do_update() {
   print_summary
 }
 
+
+advance_source_tree() {
+  printf '%s\n' "$1" >"$transaction_dir/backup/source-before" || return 1
+  printf '%s\n' "$2" >"$transaction_dir/backup/source-target" || return 1
+  : >"$transaction_dir/backup/source-attempted" || return 1
+  git -C "$repo_root" merge --ff-only "$2"
+}
+
+rollback_source_tree() {
+  [[ -f "$transaction_dir/backup/source-attempted" ]] || return 0
+  local before target head
+  before="$(cat "$transaction_dir/backup/source-before")" || return 1
+  target="$(cat "$transaction_dir/backup/source-target")" || return 1
+  head="$(git -C "$repo_root" rev-parse HEAD)" || return 1
+  [[ "$head" == "$target" || "$head" == "$before" ]] || { echo 'source changed externally; manual recovery required' >&2; return 1; }
+  # Only reset a pristine tree at exactly the commit advanced by this transaction.
+  # A partial checkout or external edits are preserved with the recovery journal.
+  if [[ -n "$(git -C "$repo_root" status --porcelain)" ]]; then
+    echo "source has edits; preserving them and recovery journal at $transaction_dir/backup" >&2
+    return 1
+  fi
+  [[ "$head" != "$before" ]] || return 0
+  git -C "$repo_root" reset --hard "$before"
+}
+
 show_status() {
   require_systemd
-  load_existing_defaults
+  load_existing_defaults read || return 1
   echo "Service:"
   systemctl --no-pager --full status "$service_name" || true
   echo
@@ -1222,11 +1303,17 @@ show_status() {
   else
     echo "No config found at $env_file"
   fi
+  dedup_status
 }
 
 do_restart() {
   require_root
   require_systemd
+  load_existing_defaults read || return 1
+  if [[ "$dedup_enabled" == 1 ]]; then
+    systemctl restart "$dedup_service_name" || return 1
+    wait_for_service_stable "$dedup_service_name" || return 1
+  fi
   systemctl restart "$service_name" || return 1
   wait_for_service_stable || return 1
   show_status
@@ -1243,12 +1330,30 @@ do_uninstall() {
   local remove_service_user=0
   [[ -f "$config_dir/user.managed" ]] && remove_service_user=1
   remove_firewall_rule "$managed_firewall_backend" "$managed_firewall_port"
-  systemctl disable --now "$service_name" 2>/dev/null || true
-  rm -f "$systemd_unit" "$bin_path" || return 1
-  rm -rf "$config_dir" || return 1
+  if [[ -f "$systemd_unit" ]] || systemctl is-active "$service_name" >/dev/null 2>&1 || systemctl is-enabled "$service_name" >/dev/null 2>&1; then
+    systemctl stop "$service_name" || return 1
+    systemctl disable "$service_name" || return 1
+  fi
+  if [[ -f "$dedup_unit" ]] || systemctl is-active "$dedup_service_name" >/dev/null 2>&1 || systemctl is-enabled "$dedup_service_name" >/dev/null 2>&1; then
+    systemctl stop "$dedup_service_name" || return 1
+    systemctl disable "$dedup_service_name" || return 1
+  fi
+  if [[ -f "$config_dir/dedup-user.managed" ]]; then
+    if id "$dedup_user" >/dev/null 2>&1; then
+      userdel "$dedup_user" || return 1
+    fi
+    rm -f "$config_dir/dedup-user.managed" || return 1
+  fi
+  rm -f "$dedup_unit" "$dedup_bin" || return 1
+  rm -f "$systemd_unit" "$bin_path" "$probe_path" || return 1
+  rm -f "$env_file" "$password_file" "$config_dir/padding.txt" "$config_dir/user.managed" \
+    "$dedup_config" "$config_dir/dedup-user.managed" "$firewall_state_file" || return 1
+  rmdir "$config_dir" 2>/dev/null || true
   systemctl daemon-reload || return 1
   if [[ "$remove_service_user" -eq 1 ]]; then
-    userdel "$service_user" >/dev/null 2>&1 || deluser "$service_user" >/dev/null 2>&1 || true
+    if id "$service_user" >/dev/null 2>&1; then
+      userdel "$service_user" >/dev/null 2>&1 || deluser "$service_user" >/dev/null 2>&1 || return 1
+    fi
   fi
   if [[ -f "$repo_root/.anytls-bootstrap-managed" && "$repo_root" != "/" && "$repo_root" != "$HOME" && "${ANYTLS_TEST_MODE:-0}" != "1" ]]; then
     echo "removing bootstrap-managed source checkout: $repo_root"
@@ -1256,6 +1361,14 @@ do_uninstall() {
   fi
   echo "anytls-server uninstalled. The shared Go toolchain and OS packages were left installed."
 }
+
+set_dedup_enabled() (
+  # A separate shell keeps menu-only choices from affecting later actions.
+  [[ -f "$env_file" ]] || { echo 'install the server before changing the decoder' >&2; return 1; }
+  dedup_requested="$1"
+  non_interactive=1
+  install_or_update
+)
 
 show_menu() {
   require_root
@@ -1269,6 +1382,8 @@ show_menu() {
     echo "4) Doctor / self-check"
     echo "5) Restart"
     echo "6) Uninstall"
+    echo "7) Enable request deduplication decoder"
+    echo "8) Disable request deduplication decoder"
     echo "0) Exit"
     read -r -p "Select [1]: " choice </dev/tty
     choice="${choice:-1}"
@@ -1279,12 +1394,16 @@ show_menu() {
       4) run_doctor ;;
       5) with_deployment_lock do_restart ;;
       6) with_deployment_lock do_uninstall ;;
+      7) with_deployment_lock set_dedup_enabled 1 ;;
+      8) with_deployment_lock set_dedup_enabled 0 ;;
       0) exit 0 ;;
       *) echo "invalid choice" ;;
     esac
   done
 }
 
+# Preserve the original CLI for candidate-version handoff, including defaults.
+original_options=("${installer_cli_options[@]}")
 if [[ "${ANYTLS_INSTALLER_LIB_ONLY:-0}" != "1" ]]; then
   case "$action" in
     install) with_deployment_lock install_or_update ;;

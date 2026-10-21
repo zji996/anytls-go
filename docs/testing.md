@@ -32,8 +32,8 @@ go test -race ./...
 脚本静态检查和语法检查：
 
 ```
-bash -n scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh
-shellcheck scripts/install-anytls-server.sh scripts/bootstrap-anytls-server.sh scripts/test-installation.sh
+bash -n scripts/install-anytls-server.sh scripts/install-dedup.sh scripts/bootstrap-anytls-server.sh scripts/test-installation.sh
+shellcheck scripts/install-anytls-server.sh scripts/install-dedup.sh scripts/bootstrap-anytls-server.sh scripts/test-installation.sh
 ```
 
 服务端 fallback 本地测试在 `cmd/server` 中覆盖：明文 TCP 探测应被转发到 fallback，并且首包数据不会丢失。
@@ -46,6 +46,21 @@ go test ./cmd/client -count=1 -v
 ```
 
 客户端测试还覆盖一次性 `-probe` 模式。实际安装时，该模式会在本机创建临时 echo 目标，经 TLS、AnyTLS 认证、stream 和服务端出站完成随机 payload 往返，不占用默认 SOCKS 端口。
+
+`-probe-dedup` 经同一 AnyTLS 通道访问保留目标 `dedup.anytls.arpa/health`，要求 HTTP 204 与有效 epoch；安装器还要求该 epoch 与本机解码端一致。测试覆盖错误状态、缺失或重复 epoch、TLS 校验、超时和资源释放。
+
+安装流程测试模拟 systemctl 和防火墙，覆盖默认启用、显式关闭与保留状态、菜单开关、旧 bootstrap 显式更新和菜单迁移、双服务独立状态回滚，以及健康/探针/文件替换失败。它不验证真实 cgroup 或系统服务恢复，后者需在隔离的 systemd 环境补验。
+
+## 真实 systemd 解码链路回归
+
+`scripts/test-systemd-dedup.py` 需要一次性 systemd Docker 容器，其中已用默认路径安装当前源码的主服务、探针和解码端；容器还需 Python 3、openssl、可写的 cgroup v2，以及只读挂载到 `/src` 的当前仓库。测试调用实际安装的探针程序作为本机代理，使用容器内合成 HTTPS origin，检查正文哈希、并发、引用节省、流式排空、崩溃恢复、冷缓存和普通代理隔离。
+
+```bash
+docker exec -e ANYTLS_SYSTEMD_TEST=1 anytls-systemd-validation \
+  python3 -u /src/scripts/test-systemd-dedup.py
+```
+
+此脚本会临时修改容器内解码 unit 并重启/停止/杀死解码进程；结束时删除测试 override、证书和日志，重启解码器恢复原 unit。它检查 Docker、PID 1 和显式测试开关，不能在生产机执行。构建/安装、开关和旧版升级仍由上面的安装流程测试覆盖。
 
 ## 性能基线
 
