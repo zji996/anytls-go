@@ -108,18 +108,34 @@ normalize_repo_url() {
 }
 
 install_packages() {
+  local packages=(ca-certificates curl git tar gzip python3 util-linux
+    coreutils diffutils findutils grep sed gawk)
   if command -v apt-get >/dev/null 2>&1; then
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl git tar gzip python3 util-linux
+    apt-get update || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" passwd iproute2 systemd || return 1
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ca-certificates curl git tar gzip python3 util-linux
+    dnf install -y "${packages[@]}" shadow-utils iproute systemd || return 1
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y ca-certificates curl git tar gzip python3 util-linux
+    yum install -y "${packages[@]}" shadow-utils iproute systemd || return 1
   elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache ca-certificates curl git tar gzip python3 util-linux
+    apk add --no-cache "${packages[@]}" shadow iproute2 || return 1
   else
-    echo "unsupported package manager; please install ca-certificates curl git tar gzip python3 util-linux manually" >&2
-    exit 1
+    echo "unsupported package manager; install the deployment tools manually (see docs/deployment.md)" >&2
+    return 1
+  fi
+  verify_bootstrap_dependencies
+}
+
+verify_bootstrap_dependencies() {
+  local tool missing=()
+  for tool in bash curl git tar gzip python3 flock awk grep sed find cmp install \
+    mktemp sha256sum stat base64 useradd userdel ss systemctl systemd-analyze; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  if (( ${#missing[@]} )); then
+    echo "missing required deployment tools after package installation: ${missing[*]}" >&2
+    echo 'use a systemd-based Linux VPS; Go is installed separately after the source version is selected.' >&2
+    return 1
   fi
 }
 
@@ -226,7 +242,7 @@ bootstrap_menu_action() (
   # effective inside package/toolchain setup, fetch and worktree creation.
   export repo_url branch install_dir go_version
   export -f detect_arch validate_install_dir validate_inputs normalize_repo_url \
-    install_packages ensure_go bootstrap_main bootstrap_menu bootstrap_menu_action
+    install_packages verify_bootstrap_dependencies ensure_go bootstrap_main bootstrap_menu bootstrap_menu_action
   bash -euo pipefail -c 'installer_args=("$@"); bootstrap_main' anytls-bootstrap "${installer_args[@]}"
 )
 

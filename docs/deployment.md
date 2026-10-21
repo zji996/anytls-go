@@ -31,7 +31,8 @@ curl -fsSL https://raw.githubusercontent.com/zji996/anytls-go/zji-dev/scripts/bo
 
 这个 bootstrap 脚本会：
 
-- 安装基础依赖：`ca-certificates`、`curl`、`git`、`tar`、`gzip`、`python3`。
+- 自动安装下载与构建依赖：`ca-certificates`、`curl`、`git`、`tar`、`gzip`、`python3`。
+- 自动补齐安装和测试工具：`util-linux`（flock）、`coreutils`、`diffutils`（cmp）、`findutils`、`grep`、`sed`、`gawk`，以及对应发行版的账号管理工具、`iproute2` / `iproute` 和 systemd。随后检查必要命令；缺少工具时在候选测试前明确报错。Go 版本仍按候选源码要求单独检查、自动安装。
 - 如果现有 Go 低于仓库 `go.mod` 要求，则安装脚本内指定的 Go 版本；下载文件会按 Go 官网 JSON 清单校验 SHA256。
 - clone 或更新 `https://github.com/zji996/anytls-go.git` 的 `zji-dev` 分支到 `/opt/anytls-go`。
 - 执行 `go mod download`，提前下载 Go modules。

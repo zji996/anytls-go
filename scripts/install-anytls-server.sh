@@ -468,7 +468,8 @@ build_staged_binaries() {
 
   local current_branch
   current_branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-  if [[ "${ANYTLS_UPDATE_STAGED:-0}" != "1" && -n "$expected_branch" && "$current_branch" != "$expected_branch" ]]; then
+  if [[ "${ANYTLS_UPDATE_STAGED:-0}" != "1" && -n "$expected_branch" && "$current_branch" != "$expected_branch" &&
+        ! ( "$current_branch" == HEAD && -f "$repo_root/.git" ) ]]; then
     echo "warning: current branch is '${current_branch:-unknown}', expected '$expected_branch'" >&2
   fi
   run_candidate_tests || return 1

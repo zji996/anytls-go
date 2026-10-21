@@ -17,6 +17,8 @@ cleanup_tests() {
   rm -rf "$test_root"
 }
 trap cleanup_tests EXIT
+# Report the failed assertion without printing commands or credentials.
+trap 'if [[ $- == *e* ]]; then echo "installation test failed at ${BASH_SOURCE[0]}:$LINENO" >&2; fi' ERR
 
 # Prevent mock uninstall test from wiping out the actual repository
 export ANYTLS_TEST_MODE=1
@@ -203,7 +205,24 @@ case "$action" in
   -D) rm -f "$rule" ;;
 esac
 EOF
-chmod +x "$mock_bin/id" "$mock_bin/install" "$mock_bin/go" "$mock_bin/cp" "$mock_bin/systemctl" "$mock_bin/ss" "$mock_bin/journalctl" "$mock_bin/sleep" "$mock_bin/probe" "$mock_bin/iptables"
+# Always shadow the other supported firewalls. Otherwise an active host UFW
+# or firewalld takes priority over mocked iptables, even with --no-firewall
+# on the installer calls: the rule-reconciliation assertions call it directly.
+cat >"$mock_bin/ufw" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == status ]]; then
+  echo 'Status: inactive'
+  exit 0
+fi
+echo 'unexpected UFW mutation in isolated installation test' >&2
+exit 1
+EOF
+cat >"$mock_bin/firewall-cmd" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == --state ]] || echo 'unexpected firewalld mutation in isolated installation test' >&2
+exit 1
+EOF
+chmod +x "$mock_bin/id" "$mock_bin/install" "$mock_bin/go" "$mock_bin/cp" "$mock_bin/systemctl" "$mock_bin/ss" "$mock_bin/journalctl" "$mock_bin/sleep" "$mock_bin/probe" "$mock_bin/iptables" "$mock_bin/ufw" "$mock_bin/firewall-cmd"
 
 old_binary="$test_root/old-server"
 new_binary="$test_root/new-server"
@@ -406,7 +425,7 @@ grep -Fq 'MemoryMax=500M' "$ANYTLS_DEDUP_SYSTEMD_UNIT"
 grep -Fq 'RestartSec=1' "$ANYTLS_DEDUP_SYSTEMD_UNIT"
 grep -Fq 'AF_UNIX' "$ANYTLS_SYSTEMD_UNIT"
 grep -Fq "Wants=$ANYTLS_DEDUP_SERVICE_NAME.service" "$ANYTLS_SYSTEMD_UNIT"
-if rg -q 'Requires=|BindsTo=|PartOf=' "$ANYTLS_SYSTEMD_UNIT"; then exit 1; fi
+if grep -Eq 'Requires=|BindsTo=|PartOf=' "$ANYTLS_SYSTEMD_UNIT"; then exit 1; fi
 "$installer" doctor >"$test_root/dedup-doctor.log" 2>&1
 "$installer" "${dedup_args[@]}" --without-dedup >/dev/null
 [[ -f "$MOCK_SYSTEMCTL_ACTIVE" && ! -e "$MOCK_SYSTEMCTL_ACTIVE.dedup" && ! -e "$MOCK_SYSTEMCTL_ENABLED.dedup" ]]
@@ -617,6 +636,57 @@ ANYTLS_BOOTSTRAP_LIB_ONLY=1 bash -c '
 
 echo "bootstrap validation tests passed"
 
+# Check package selection and failure handling without invoking a host manager.
+ANYTLS_BOOTSTRAP_LIB_ONLY=1 bash -s -- "$script_dir/bootstrap-anytls-server.sh" "$test_root" <<'EOF'
+set -euo pipefail
+bootstrap_script=$1 package_test_root=$2
+set --
+source "$bootstrap_script"
+(
+  command() {
+    [[ "$*" != '-v cmp' ]] || return 1
+    builtin command "$@"
+  }
+  if verify_bootstrap_dependencies >"$package_test_root/missing-tools.log" 2>&1; then
+    echo 'dependency check accepted missing cmp' >&2
+    exit 1
+  fi
+  grep -q 'missing required deployment tools.*cmp' "$package_test_root/missing-tools.log"
+)
+command() {
+  case "${1:-}:${2:-}" in
+    -v:apt-get|-v:dnf|-v:yum|-v:apk) [[ "$2" == "$test_manager" ]] ;;
+    *) builtin command "$@" ;;
+  esac
+}
+record_package_call() {
+  printf '%s\n' "$*" >>"$package_test_root/packages.log"
+  [[ "$fail_packages" == 0 ]]
+}
+apt-get() { record_package_call apt-get "$@"; }
+dnf() { record_package_call dnf "$@"; }
+yum() { record_package_call yum "$@"; }
+apk() { record_package_call apk "$@"; }
+verify_bootstrap_dependencies() { echo checked >>"$package_test_root/packages.log"; }
+for test_manager in apt-get dnf yum apk; do
+  fail_packages=0
+  : >"$package_test_root/packages.log"
+  install_packages
+  grep -q 'coreutils diffutils findutils grep sed gawk' "$package_test_root/packages.log"
+  grep -qx checked "$package_test_root/packages.log"
+  case "$test_manager" in
+    apt-get) grep -q 'passwd iproute2 systemd' "$package_test_root/packages.log" ;;
+    dnf|yum) grep -q 'shadow-utils iproute systemd' "$package_test_root/packages.log" ;;
+    apk) grep -q 'shadow iproute2' "$package_test_root/packages.log" ;;
+  esac
+  fail_packages=1
+  : >"$package_test_root/packages.log"
+  if install_packages; then echo 'package failure was ignored' >&2; exit 1; fi
+  if grep -qx checked "$package_test_root/packages.log"; then exit 1; fi
+done
+EOF
+echo 'bootstrap dependency installation and preflight tests passed'
+
 ANYTLS_BOOTSTRAP_LIB_ONLY=1 bash -c '
   bootstrap_script=$1
   set -- menu --no-firewall
@@ -697,7 +767,7 @@ run_bootstrap_fixture menu >"$test_root/bootstrap-success.log" 2>&1
 [[ "$(git -C "$bootstrap_checkout" rev-parse HEAD)" == "$bootstrap_new_commit" ]]
 grep -q '^ANYTLS_DEDUP_ENABLED=1$' "$ANYTLS_ENV_FILE"
 [[ -f "$MOCK_SYSTEMCTL_ACTIVE.dedup" && -f "$MOCK_SYSTEMCTL_ACTIVE" ]]
-[[ "$(git -C "$bootstrap_checkout" worktree list --porcelain | rg -c '^worktree ')" == 1 ]]
+[[ "$(git -C "$bootstrap_checkout" worktree list --porcelain | grep -c '^worktree ')" == 1 ]]
 "$installer" uninstall --non-interactive >/dev/null
 echo 'legacy bootstrap menu/update decoder migration and rollback tests passed'
 

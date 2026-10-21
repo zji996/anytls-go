@@ -51,6 +51,8 @@ go test ./cmd/client -count=1 -v
 
 安装流程测试模拟 systemctl 和防火墙，覆盖默认启用、显式关闭与保留状态、菜单开关、旧 bootstrap 显式更新和菜单迁移、双服务独立状态回滚，以及健康/探针/文件替换失败。它不验证真实 cgroup 或系统服务恢复，后者需在隔离的 systemd 环境补验。
 
+防火墙隔离同时覆盖 iptables、UFW 和 firewalld；测试不会根据宿主机的启用状态选择真实工具。测试仅使用 bootstrap 已安装的系统工具，不依赖开发机上的 `rg`。候选 worktree 使用 detached HEAD，属于正常的源码暂存状态。
+
 ## 真实 systemd 解码链路回归
 
 `scripts/test-systemd-dedup.py` 需要一次性 systemd Docker 容器，其中已用默认路径安装当前源码的主服务、探针和解码端；容器还需 Python 3、openssl、可写的 cgroup v2，以及只读挂载到 `/src` 的当前仓库。测试调用实际安装的探针程序作为本机代理，使用容器内合成 HTTPS origin，检查正文哈希、并发、引用节省、流式排空、崩溃恢复、冷缓存和普通代理隔离。
