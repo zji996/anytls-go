@@ -33,12 +33,16 @@ type tlsOrigin struct {
 	bodies    [][]byte
 	protos    []string
 	encodings []string
+	// delay holds each answer back, like a model thinking before its first
+	// token.
+	delay atomic.Int64
 }
 
 func newTLSOrigin(t *testing.T) *tlsOrigin {
 	o := &tlsOrigin{}
 	o.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		time.Sleep(time.Duration(o.delay.Load()))
 		o.mu.Lock()
 		o.bodies = append(o.bodies, body)
 		o.protos = append(o.protos, r.Proto)
@@ -433,6 +437,29 @@ func TestFrontSendsToOriginWhenDecoderPathStalls(t *testing.T) {
 	}
 	if s := c.front.snapshot(); s["fallbacks"].(int64) != 1 {
 		t.Fatalf("want one fallback: %v", s)
+	}
+}
+
+// An origin that takes many ping intervals to answer, while the path stays
+// healthy, is waited for: pings are answered beside the open request, so
+// nothing is resent.
+func TestFrontWaitsForASlowOriginOverHTTP2(t *testing.T) {
+	ping := decoderPing
+	decoderPing = 50 * time.Millisecond
+	t.Cleanup(func() { decoderPing = ping })
+	c := newFrontChain(t, true)
+	images := []string{image(300 << 10), image(300 << 10)}
+	c.post(t, c.client, conversation(1, images))
+	c.origin.delay.Store(int64(time.Second))
+	c.post(t, c.client, conversation(2, images))
+	c.origin.mu.Lock()
+	got := len(c.origin.bodies)
+	c.origin.mu.Unlock()
+	if got != 2 {
+		t.Fatalf("origin got %d requests, want 2: a slow answer was resent", got)
+	}
+	if s := c.front.snapshot(); s["framed"].(int64) != 2 || s["fallbacks"].(int64) != 0 || !c.enc.useH2.Load() {
+		t.Fatalf("want two frames over HTTP/2 and no fallback: %v", s)
 	}
 }
 
