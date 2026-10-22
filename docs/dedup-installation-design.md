@@ -96,7 +96,7 @@ sudo bash /opt/anytls-go/scripts/install-anytls-server.sh update --without-dedup
 2. 获取候选提交，在 staging 构建主程序、探针和需要的解码程序；先运行相关测试、配置校验和 systemd unit 校验。确认自带 `--binary` 支持去重；不支持时在切换前失败。
 3. 备份主程序、探针、解码程序、配置、unit、受管用户标记、目录权限、两个服务的运行和自启状态。发现自定义 systemd drop-in 时在预检阶段拒绝部署，需先人工迁移。备份完整后才允许修改目标部署。
 4. 原子安装候选文件。开启时先启动解码端并验证健康，再切换主服务接入；检查 socket 可由主服务身份访问。普通代理连接在主服务切换时会短暂中断。
-5. 运行普通 AnyTLS 数据往返探针，再经实际 AnyTLS 通道访问 `dedup.anytls.arpa/health`；要求 HTTP `204` 且存在有效 `X-Edge-Dedup-Epoch`，并与本机解码端健康检查一致。
+5. 运行普通 AnyTLS 数据往返探针，再经实际 AnyTLS 通道访问 `dedup.anytls.arpa/health`；要求 HTTP `204` 且存在有效 `X-Edge-Dedup-Epoch`，并与本机解码端健康检查一致。新版解码端在同一响应中带 `X-Edge-Dedup-H2c: 1`，表示同时接受不加密的 HTTP/2；探针不要求它。
 6. 关闭时先应用撤销后端的主服务配置并验证普通代理，再停止、禁用解码端。关闭后的保留配置不参与开机启动。
 7. 两端检查成功后快进主源码目录，提交服务事务；源码推进失败也恢复旧部署。
 

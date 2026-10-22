@@ -270,7 +270,7 @@ func runBack(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	server := &http.Server{Handler: dec, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second}
+	server := newDecoderServer(dec)
 	log.Printf("dedup back on %s for %s", *listen, strings.Join(dec.hosts, ","))
 	go func() {
 		if err := server.Serve(ln); !errors.Is(err, http.ErrServerClosed) {

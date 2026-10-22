@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,13 +71,24 @@ type frontChain struct {
 	enc    *encoder
 	front  *front
 	back   *httptest.Server
-	proxy  *url.URL
-	roots  *x509.CertPool
+	// relay carries everything from the encoder to back.
+	relay *stallRelay
+	// backProtos counts the requests back got per protocol.
+	backProtos sync.Map // string -> *atomic.Int64
+	proxy      *url.URL
+	roots      *x509.CertPool
 	// client trusts the private CA only, like Sub2API with the CA added.
 	client *http.Client
 }
 
 func newFrontChain(t *testing.T, probe bool) *frontChain {
+	t.Helper()
+	return buildFrontChain(t, probe, true)
+}
+
+// buildFrontChain is newFrontChain, with a decoder that speaks HTTP/1 only
+// unless h2c, as before HTTP/2 was offered.
+func buildFrontChain(t *testing.T, probe, h2c bool) *frontChain {
 	t.Helper()
 	c := &frontChain{origin: newTLSOrigin(t)}
 	originAddr := c.origin.srv.Listener.Addr().String()
@@ -89,8 +101,18 @@ func newFrontChain(t *testing.T, probe bool) *frontChain {
 
 	dec := newDecoder(toOrigin, 64<<20, 64<<20)
 	dec.hosts = domainList{"example.com"}
-	c.back = httptest.NewServer(dec)
+	c.back = httptest.NewUnstartedServer(dec)
+	if h2c {
+		c.back.Config = newDecoderServer(dec)
+	}
+	c.back.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, _ := c.backProtos.LoadOrStore(r.Proto, new(atomic.Int64))
+		n.(*atomic.Int64).Add(1)
+		dec.ServeHTTP(w, r)
+	})
+	c.back.Start()
 	t.Cleanup(c.back.Close)
+	c.relay = newStallRelay(t, c.back.Listener.Addr().String())
 
 	dir := t.TempDir()
 	domains := domainList{"example.com"}
@@ -101,7 +123,7 @@ func newFrontChain(t *testing.T, probe bool) *frontChain {
 	if c.ca, err = loadAuthority(dir); err != nil {
 		t.Fatal(err)
 	}
-	backURL := mustURL(t, c.back.URL)
+	backURL := mustURL(t, "http://"+c.relay.ln.Addr().String())
 	dial := func(ctx context.Context, dest M.Socksaddr) (net.Conn, error) {
 		// Every name leads to the origin, as the exit would resolve it.
 		return (&net.Dialer{}).DialContext(ctx, "tcp", originAddr)
@@ -155,6 +177,80 @@ func (c *frontChain) clientTrusting(roots *x509.CertPool) *http.Client {
 		ForceAttemptHTTP2: true,
 	}
 	return &http.Client{Transport: tr}
+}
+
+func (c *frontChain) backGot(proto string) int64 {
+	if n, ok := c.backProtos.Load(proto); ok {
+		return n.(*atomic.Int64).Load()
+	}
+	return 0
+}
+
+// stallRelay forwards TCP connections to addr. While stalled it holds every
+// byte it reads but keeps the connections open, like an exit path that drops
+// what it is sent while the TCP connection over it retransmits.
+type stallRelay struct {
+	ln      net.Listener
+	stalled atomic.Bool
+	closed  atomic.Bool
+	mu      sync.Mutex
+	conns   []net.Conn
+}
+
+func newStallRelay(t *testing.T, addr string) *stallRelay {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &stallRelay{ln: ln}
+	t.Cleanup(func() {
+		r.closed.Store(true)
+		ln.Close()
+		r.mu.Lock()
+		for _, c := range r.conns {
+			c.Close()
+		}
+		r.mu.Unlock()
+	})
+	go func() {
+		for {
+			down, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			up, err := net.Dial("tcp", addr)
+			if err != nil {
+				down.Close()
+				continue
+			}
+			r.mu.Lock()
+			r.conns = append(r.conns, down, up)
+			r.mu.Unlock()
+			go r.pipe(up, down)
+			go r.pipe(down, up)
+		}
+	}()
+	return r
+}
+
+func (r *stallRelay) pipe(dst, src net.Conn) {
+	defer dst.Close()
+	defer src.Close()
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := src.Read(buf)
+		for n > 0 && r.stalled.Load() && !r.closed.Load() {
+			time.Sleep(10 * time.Millisecond)
+		}
+		if n > 0 {
+			if _, err := dst.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 func (c *frontChain) post(t *testing.T, client *http.Client, body []byte) *http.Response {
@@ -266,6 +362,78 @@ func TestFrontSendsToOriginWhenDecoderDies(t *testing.T) {
 		t.Fatalf("want one fallback and framing paused: %v", s)
 	}
 	c.post(t, c.client, conversation(2, images))
+}
+
+func TestFrontFramesOverHTTP2WhenDecoderOffersIt(t *testing.T) {
+	c := newFrontChain(t, true)
+	if !c.enc.useH2.Load() {
+		t.Fatal("the decoder's HTTP/2 offer was not taken up")
+	}
+	images := []string{image(300 << 10), image(300 << 10)}
+	c.post(t, c.client, conversation(1, images))
+	c.post(t, c.client, conversation(2, images))
+	if n := c.backGot("HTTP/2.0"); n < 2 {
+		t.Fatalf("decoder got %d requests over HTTP/2, want the probe and both frames", n)
+	}
+	if s := c.front.snapshot(); s["framed"].(int64) != 2 || s["fallbacks"].(int64) != 0 {
+		t.Fatalf("want two frames and no fallback: %v", s)
+	}
+}
+
+func TestFrontKeepsHTTP1ForOlderDecoders(t *testing.T) {
+	c := buildFrontChain(t, true, false)
+	if c.enc.useH2.Load() {
+		t.Fatal("HTTP/2 taken up though the decoder did not offer it")
+	}
+	images := []string{image(300 << 10), image(300 << 10)}
+	c.post(t, c.client, conversation(1, images))
+	c.post(t, c.client, conversation(2, images))
+	if n := c.backGot("HTTP/2.0"); n != 0 {
+		t.Fatalf("an HTTP/1 decoder got %d HTTP/2 requests", n)
+	}
+	if s := c.front.snapshot(); s["framed"].(int64) != 2 || s["fallbacks"].(int64) != 0 {
+		t.Fatalf("want two frames and no fallback: %v", s)
+	}
+}
+
+// A path to the decoder that goes silent under an open connection fails the
+// frame on it within a couple of pings, instead of when TCP gives up a
+// quarter of an hour later, and the frame goes to the origin.
+func TestFrontSendsToOriginWhenDecoderPathStalls(t *testing.T) {
+	ping := decoderPing
+	decoderPing = 100 * time.Millisecond
+	t.Cleanup(func() { decoderPing = ping })
+	c := newFrontChain(t, true)
+	images := []string{image(300 << 10), image(300 << 10)}
+	c.post(t, c.client, conversation(1, images))
+	c.relay.stalled.Store(true)
+	done := make(chan error, 1)
+	go func() {
+		resp, err := c.client.Post("https://example.com/backend-api/codex/responses", "application/json",
+			bytes.NewReader(conversation(2, images)))
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				err = errStatus(resp.StatusCode)
+			}
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the frame is still waiting on the stalled path")
+	}
+	if last, _ := c.origin.last(); !bytes.Equal(last, conversation(2, images)) {
+		t.Fatal("origin did not get the original body")
+	}
+	if s := c.front.snapshot(); s["fallbacks"].(int64) != 1 {
+		t.Fatalf("want one fallback: %v", s)
+	}
 }
 
 func TestGoGzipHeaderReachesOriginAndResponseDecodes(t *testing.T) {

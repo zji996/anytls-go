@@ -24,6 +24,7 @@ const (
 	hdrEpoch   = "X-Edge-Dedup-Epoch"   // decoder instance; on every decoder response
 	hdrMissing = "X-Edge-Dedup-Missing" // 409: count of unknown references (hashes in body)
 	hdrReset   = "X-Edge-Dedup-Reset"   // 409: decoder restarted, drop the whole index
+	hdrH2C     = "X-Edge-Dedup-H2c"     // "1" on /health: the decoder also speaks HTTP/2 without TLS
 )
 
 // dedupHost names the decoder itself; anytls servers route streams to it to
@@ -135,7 +136,12 @@ type encoder struct {
 	unmarked  atomic.Int64 // consecutive responses without a decoder epoch
 	proxy     *httputil.ReverseProxy
 	base      http.RoundTripper
-	stats     counters
+	// h2 reaches the decoder over HTTP/2 without TLS, pinged so that a path
+	// that stops delivering fails the requests on it; nil where the path to
+	// the decoder cannot carry it. useH2 is set while the decoder offers it.
+	h2    http.RoundTripper
+	useH2 atomic.Bool
+	stats counters
 
 	// inflight may be shared by the encoders of several exits.
 	inflight *budget
@@ -181,8 +187,11 @@ func newEncoder(upstream route, indexBytes, maxBody int64) *encoder {
 	e.lastEpoch.Store("")
 	e.proxy = newProxy(upstream)
 	e.base = e.proxy.Transport
+	if t, ok := e.base.(*http.Transport); ok && carriesH2C(upstream) {
+		e.h2 = h2cTransport(t)
+	}
 	e.proxy.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return e.roundTrip(e.base, req)
+		return e.roundTrip(e.toDecoder(), req)
 	})
 	e.proxy.ModifyResponse = func(resp *http.Response) error {
 		if epoch := resp.Header.Get(hdrEpoch); epoch != "" {
@@ -207,6 +216,30 @@ func readBody(r io.Reader, n int64) ([]byte, error) {
 	b := make([]byte, n)
 	_, err := io.ReadFull(r, b)
 	return b, err
+}
+
+// carriesH2C reports whether HTTP/2 without TLS can reach up's decoder: an
+// HTTP proxy would get the requests themselves, not a tunnel.
+func carriesH2C(up route) bool {
+	return up.url != nil && up.url.Scheme == "http" &&
+		(up.via == nil || up.via.Scheme == "socks5" || up.via.Scheme == "socks5h")
+}
+
+func h2cTransport(plain *http.Transport) *http.Transport {
+	t := plain.Clone()
+	var protocols http.Protocols
+	protocols.SetUnencryptedHTTP2(true)
+	t.Protocols = &protocols
+	t.HTTP2 = &http.HTTP2Config{SendPingTimeout: decoderPing, PingTimeout: decoderPing}
+	return t
+}
+
+// toDecoder is the transport for requests to the decoder.
+func (e *encoder) toDecoder() http.RoundTripper {
+	if e.h2 != nil && e.useH2.Load() {
+		return e.h2
+	}
+	return e.base
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -237,23 +270,34 @@ func (e *encoder) pause(why string, err error) {
 }
 
 // probe asks the decoder for its epoch, through the same path as requests.
+// A decoder that offers HTTP/2 is probed over it from then on; should that
+// fail, the next probe goes over HTTP/1 again.
 func (e *encoder) probe(ctx context.Context, decoder *url.URL) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, decoder.JoinPath("/health").String(), nil)
 	req.Host = dedupHost
-	resp, err := e.base.RoundTrip(req)
+	resp, err := e.toDecoder().RoundTrip(req)
 	if err != nil {
+		e.offerH2(false)
 		e.pause("decoder probe", err)
 		return
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
 	if epoch := resp.Header.Get(hdrEpoch); resp.StatusCode == http.StatusNoContent && epoch != "" {
+		e.offerH2(resp.Header.Get(hdrH2C) == "1")
 		e.learnEpoch(epoch)
 		return
 	}
+	e.offerH2(false)
 	e.pause("decoder probe", errStatus(resp.StatusCode))
+}
+
+func (e *encoder) offerH2(on bool) {
+	if e.h2 != nil && e.useH2.Swap(on) != on && on {
+		log.Printf("decoder speaks HTTP/2; frames share one pinged connection")
+	}
 }
 
 type errStatus int
@@ -561,6 +605,37 @@ type decoder struct {
 	misses   atomic.Int64
 	// hosts, if set, are the only origins requests may name.
 	hosts domainList
+	// h2c is set once a server that also speaks HTTP/2 without TLS serves it.
+	h2c bool
+}
+
+// decoderPing is how long either end of a decoder connection waits for a
+// frame before it pings, and then for the answer. An exit path that stops
+// delivering, while the TCP connection under it still retransmits for a
+// quarter of an hour, is found within about twice this.
+var decoderPing = 15 * time.Second
+
+// newDecoderServer serves d over HTTP/1 and over HTTP/2 without TLS; fronts
+// that saw hdrH2C send all their frames over one pinged connection.
+func newDecoderServer(d *decoder) *http.Server {
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
+	d.h2c = true
+	return &http.Server{
+		Handler:           d,
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		Protocols:         &protocols,
+		HTTP2: &http.HTTP2Config{
+			SendPingTimeout: decoderPing,
+			PingTimeout:     decoderPing,
+			// The default 1 MiB per connection would cap the frames sharing
+			// one at about 1 MiB per round trip.
+			MaxReceiveBufferPerConnection: 16 << 20,
+			MaxReceiveBufferPerStream:     8 << 20,
+		},
+	}
 }
 
 func newDecoder(upstream route, cacheBytes, maxBody int64) *decoder {
@@ -599,6 +674,9 @@ func (d *decoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/health" {
 			http.NotFound(w, r)
 			return
+		}
+		if d.h2c {
+			w.Header().Set(hdrH2C, "1")
 		}
 		w.WriteHeader(http.StatusNoContent)
 		return
