@@ -34,7 +34,7 @@ import (
 )
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: dedup front|back|ca [flags]")
+	fmt.Fprintln(os.Stderr, "usage: dedup front|back|ca|encode|decode [flags]")
 	os.Exit(2)
 }
 
@@ -49,6 +49,10 @@ func main() {
 		runBack(os.Args[2:])
 	case "ca":
 		runCA(os.Args[2:])
+	case "encode":
+		runEncode(os.Args[2:])
+	case "decode":
+		runDecode(os.Args[2:])
 	default:
 		usage()
 	}

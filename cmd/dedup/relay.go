@@ -35,6 +35,8 @@ const dedupHost = "dedup.anytls.arpa"
 type route struct {
 	// url is nil for the HTTPS origin named by each request's Host.
 	url *url.URL
+	// table, if set instead of url, picks a plain HTTP service by Host.
+	table *routeTable
 	// via is an HTTP or SOCKS5 proxy in front of url, e.g. an anytls client.
 	via *url.URL
 	// upstreamHost sends url's host instead of the client's Host, as a public
@@ -68,7 +70,7 @@ func newProxy(up route) *httputil.ReverseProxy {
 		}
 	}
 	var rt http.RoundTripper = transport
-	if up.url == nil {
+	if up.url == nil && up.table == nil {
 		// Like Sub2API's OpenAI transport: HTTP/2 with ping health checks.
 		transport.ForceAttemptHTTP2 = true
 		transport.TLSClientConfig = up.tls
@@ -77,7 +79,11 @@ func newProxy(up route) *httputil.ReverseProxy {
 	}
 	return &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
-			if up.url == nil {
+			if up.table != nil {
+				// The decoder only forwards hosts it found a service for.
+				r.SetURL(r.In.Context().Value(serviceCtxKey{}).(*url.URL))
+				r.Out.Host = r.In.Host
+			} else if up.url == nil {
 				r.Out.URL.Scheme = "https"
 				r.Out.URL.Host = r.In.Host
 				r.Out.Host = r.In.Host
@@ -159,6 +165,9 @@ type encoder struct {
 const unmarkedLimit = 3
 
 type frameCtxKey struct{}
+
+// serviceCtxKey carries the service a routed decoder picked for a request.
+type serviceCtxKey struct{}
 
 type framedRequest struct {
 	body    []byte
@@ -605,6 +614,8 @@ type decoder struct {
 	misses   atomic.Int64
 	// hosts, if set, are the only origins requests may name.
 	hosts domainList
+	// routes, if set, map each Host to its service; others are refused.
+	routes *routeTable
 	// h2c is set once a server that also speaks HTTP/2 without TLS serves it.
 	h2c bool
 }
@@ -642,6 +653,7 @@ func newDecoder(upstream route, cacheBytes, maxBody int64) *decoder {
 	var b [8]byte
 	rand.Read(b[:])
 	d := &decoder{cache: newLRU(cacheBytes), maxBody: maxBody, maxFrame: maxBody + maxBody/8 + 4096, epoch: hex.EncodeToString(b[:])}
+	d.routes = upstream.table
 	d.proxy = newProxy(upstream)
 	d.proxy.ModifyResponse = func(resp *http.Response) error {
 		resp.Header.Set(hdrEpoch, d.epoch)
@@ -684,6 +696,14 @@ func (d *decoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("refused %s %s for host %q", r.Method, r.URL.Path, r.Host)
 		http.Error(w, "host not allowed", http.StatusForbidden)
 		return
+	} else if d.routes != nil {
+		service := d.routes.lookup(r.Host)
+		if service == nil {
+			log.Printf("refused %s %s for host %q: no route", r.Method, r.URL.Path, r.Host)
+			http.Error(w, "host not routed", http.StatusForbidden)
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), serviceCtxKey{}, service))
 	}
 	if r.Header.Get(hdrFrame) != "1" {
 		d.stats.plain.Add(1)
