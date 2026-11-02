@@ -158,6 +158,8 @@ type encoder struct {
 	// decoder cannot be reached.
 	origin   http.RoundTripper
 	compress compression
+	// images, if set, measures what re-encoding screenshots would save.
+	images *imageShadow
 }
 
 // A path with no decoder (frpc pointed straight at the origin) answers without
@@ -467,6 +469,9 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request body read failed", http.StatusBadRequest)
 		return
 	}
+	if e.images != nil {
+		e.images.observe(body)
+	}
 	res, err := encodeFrame(body, e.known, e.compress)
 	if err != nil {
 		e.known.settle(res.litHashes, false)
@@ -592,13 +597,17 @@ func (e *encoder) snapshot() map[string]any {
 	if sent > 0 {
 		ratio = float64(orig) / float64(sent)
 	}
-	return map[string]any{
+	snap := map[string]any{
 		"role": "encode", "epoch": e.epoch.Load(), "framed": e.stats.framed.Load(), "plain": e.stats.plain.Load(),
 		"retries": e.stats.retries.Load(), "resets": e.stats.resets.Load(), "misdelivered": e.stats.misdelivered.Load(),
 		"fallbacks": e.stats.fallbacks.Load(), "busy": e.stats.busy.Load(), "inflight_bytes": e.inflight.used.Load(),
 		"original_bytes": orig, "sent_bytes": sent, "ref_bytes": e.stats.refBytes.Load(), "ratio": ratio,
 		"index_entries": entries, "index_bytes": used,
 	}
+	if e.images != nil {
+		snap["images"] = e.images.snapshot()
+	}
+	return snap
 }
 
 // ---- decoder (LAN side) --------------------------------------------------

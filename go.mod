@@ -7,4 +7,9 @@ require (
 	github.com/sirupsen/logrus v1.9.3
 )
 
-require golang.org/x/sys v0.29.0
+require (
+	github.com/gen2brain/webp v0.6.4
+	golang.org/x/sys v0.29.0
+)
+
+require github.com/ebitengine/purego v0.10.1 // indirect

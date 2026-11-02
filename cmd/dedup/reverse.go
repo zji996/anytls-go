@@ -41,6 +41,9 @@ func runEncode(args []string) {
 	compressFlag := fs.String("compress", "auto", "CPU for content the decoder lacks: auto, huffman (cheaper) or off (cache only)")
 	probe := fs.Duration("probe-interval", 5*time.Second, "decoder health check interval")
 	drain := fs.Duration("drain", 30*time.Second, "on SIGTERM, time for open requests to finish")
+	imagesFlag := fs.String("images", imagesOff, "PNG data URLs: off, or shadow (measure what WebP would save; requests are not changed)")
+	imagesQuality := fs.Int("images-quality", 90, "WebP quality the shadow measures")
+	imagesWorkers := fs.Int("images-workers", 1, "background transcodes at a time")
 	fs.Parse(args)
 	if *listen == "" || *upstream == "" {
 		log.Fatal("-listen and -upstream are required")
@@ -53,8 +56,16 @@ func runEncode(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
+	images, err := parseImages(*imagesFlag, *imagesQuality, *imagesWorkers)
+	if err != nil {
+		log.Fatal(err)
+	}
 	if *memoryMiB == 0 {
 		*memoryMiB = *indexMiB/8 + *inflightMiB + 64
+		if images != nil {
+			// Queued copies plus one decoded image per worker.
+			*memoryMiB += 64 + int64(*imagesWorkers)*imageMaxDecodeMiB
+		}
 	}
 	setMemoryLimit(*memoryMiB)
 	preferOOMKill(*oomScore)
@@ -63,6 +74,7 @@ func runEncode(args []string) {
 	enc.inflight = &budget{limit: *inflightMiB << 20}
 	enc.inflightWait = *inflightWait
 	enc.compress = mode
+	enc.images = images
 	go probeLoop(enc, up, *probe, nil)
 	serveAdmin(*admin, enc.snapshot)
 
