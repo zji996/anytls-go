@@ -9,6 +9,7 @@ require (
 
 require (
 	github.com/gen2brain/webp v0.6.4
+	github.com/klauspost/compress v1.18.5
 	golang.org/x/sys v0.29.0
 )
 

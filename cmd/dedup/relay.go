@@ -130,6 +130,11 @@ type counters struct {
 	framed, plain, retries, resets atomic.Int64
 	misdelivered, fallbacks, busy  atomic.Int64
 	original, sent, refBytes       atomic.Int64
+	// Encoder: zstd bodies framed, their compressed bytes, and those passed
+	// on as they came. Decoder: bodies compressed again for the origin.
+	zstd, zstdBytes, zstdPassed, zstdRestored atomic.Int64
+	// Decoder: frames over its limits, answered with a plain resend.
+	tooLarge atomic.Int64
 }
 
 // ---- encoder (egress side) ----------------------------------------------
@@ -147,7 +152,9 @@ type encoder struct {
 	// the decoder cannot carry it. useH2 is set while the decoder offers it.
 	h2    http.RoundTripper
 	useH2 atomic.Bool
-	stats counters
+	// zstdOK is set while the decoder can restore a zstd coding.
+	zstdOK atomic.Bool
+	stats  counters
 
 	// inflight may be shared by the encoders of several exits.
 	inflight *budget
@@ -174,7 +181,16 @@ type frameCtxKey struct{}
 type serviceCtxKey struct{}
 
 type framedRequest struct {
-	body    []byte
+	body []byte
+	// coding is the Content-Encoding the client sent, undone in body; orig
+	// is the body as the client sent it while body still equals its
+	// decoding, else nil.
+	coding string
+	orig   []byte
+	// recoded is body compressed again for a resend once images were
+	// rewritten; resendBytes makes it at most once.
+	recode  sync.Once
+	recoded []byte
 	lits    []digest
 	held    *share
 	known   *lru
@@ -293,6 +309,7 @@ func (e *encoder) probe(ctx context.Context, decoder *url.URL) {
 	resp, err := e.toDecoder().RoundTrip(req)
 	if err != nil {
 		e.offerH2(false)
+		e.zstdOK.Store(false)
 		e.pause("decoder probe", err)
 		return
 	}
@@ -300,10 +317,12 @@ func (e *encoder) probe(ctx context.Context, decoder *url.URL) {
 	resp.Body.Close()
 	if epoch := resp.Header.Get(hdrEpoch); resp.StatusCode == http.StatusNoContent && epoch != "" {
 		e.offerH2(resp.Header.Get(hdrH2C) == "1")
+		e.zstdOK.Store(offersCoding(resp.Header.Get(hdrCodings), codingZstd))
 		e.learnEpoch(epoch)
 		return
 	}
 	e.offerH2(false)
+	e.zstdOK.Store(false)
 	e.pause("decoder probe", errStatus(resp.StatusCode))
 }
 
@@ -318,10 +337,11 @@ type errStatus int
 func (s errStatus) Error() string { return "status " + strconv.Itoa(int(s)) }
 
 func (e *encoder) eligible(r *http.Request) bool {
+	coding := requestCoding(r.Header)
 	return e.healthy() &&
 		(r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch) &&
 		r.ContentLength > minChunk && r.ContentLength <= e.maxBody &&
-		r.Header.Get("Content-Encoding") == "" && r.Header.Get("Upgrade") == ""
+		(coding == "" || coding == codingZstd && e.zstdOK.Load()) && r.Header.Get("Upgrade") == ""
 }
 
 // budget bounds the bytes held by requests being framed or rebuilt.
@@ -415,6 +435,22 @@ func (s *share) shrink(to int64) {
 
 func (s *share) free() { s.shrink(0) }
 
+// grow adds n bytes to the share, waiting up to wait for the budget; on
+// false the share is as it was.
+func (s *share) grow(ctx context.Context, n int64, wait time.Duration) bool {
+	if n <= 0 {
+		return true
+	}
+	extra := s.b.takeWithin(ctx, n, wait)
+	if extra == nil {
+		return false
+	}
+	s.mu.Lock()
+	s.n += extra.n
+	s.mu.Unlock()
+	return true
+}
+
 // releasingBody serves b once and drops it, calling done, when the transport
 // has read it to the end or closed it. A streamed answer can last minutes;
 // the request body is not needed for any of it.
@@ -471,31 +507,58 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request body read failed", http.StatusBadRequest)
 		return
 	}
+	coding, raw := requestCoding(r.Header), body
+	if coding == codingZstd {
+		var ok bool
+		body, ok = e.decodeZstd(r.Context(), raw, held)
+		if !ok {
+			// Not decodable, too large, empty or no memory: on as it came,
+			// holding no more than the body itself.
+			held.shrink(int64(len(raw)))
+			e.stats.zstdPassed.Add(1)
+			e.stats.plain.Add(1)
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			e.proxy.ServeHTTP(w, r)
+			return
+		}
+		e.stats.zstd.Add(1)
+		e.stats.zstdBytes.Add(int64(len(raw)))
+		r.Header.Del("Content-Encoding")
+	}
+	decoded := body
 	if e.images != nil {
 		body = e.images.process(r.Context(), body)
+	}
+	framed := &framedRequest{body: body, coding: coding, held: held, known: e.known}
+	if coding == codingZstd && len(body) > 0 && &body[0] == &decoded[0] {
+		// No image was rewritten: a resend can carry the client's own bytes.
+		framed.orig = raw
 	}
 	res, err := encodeFrame(body, e.known, e.compress)
 	if err != nil {
 		e.known.settle(res.litHashes, false)
 		log.Printf("encode: %v; sending plain", err)
 		e.stats.plain.Add(1)
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		r.ContentLength = int64(len(body))
-		e.proxy.ServeHTTP(w, r)
+		plain := plainCopy(r, framed)
+		e.proxy.ServeHTTP(w, plain)
 		return
 	}
 	// Only the body, kept for resends, and the frame are still referenced.
-	held.shrink(int64(len(body) + len(res.frame)))
+	held.shrink(int64(len(body) + len(framed.orig) + len(res.frame)))
 	e.stats.framed.Add(1)
 	e.stats.original.Add(int64(len(body)))
 	e.stats.sent.Add(int64(len(res.frame)))
 	e.stats.refBytes.Add(int64(res.refBytes))
-	framed := &framedRequest{body: body, lits: res.litHashes, held: held, known: e.known}
+	framed.lits = res.litHashes
 	// Unanswered claims would keep their chunks from being referenced.
 	defer framed.settle(false)
 	r = r.WithContext(context.WithValue(r.Context(), frameCtxKey{}, framed))
-	r.Body = &releasingBody{b: res.frame, done: func() { held.shrink(int64(len(body))) }}
+	kept := int64(len(body) + len(framed.orig))
+	r.Body = &releasingBody{b: res.frame, done: func() { held.shrink(kept) }}
 	r.ContentLength = int64(len(res.frame))
+	if coding != "" {
+		r.Header.Set(hdrCoding, coding)
+	}
 	r.Header.Set(hdrFrame, "1")
 	r.Header.Set(hdrLen, strconv.Itoa(len(body)))
 	r.Header.Set(hdrEpoch, e.epoch.Load().(string))
@@ -582,12 +645,34 @@ func (e *encoder) misdelivered(base http.RoundTripper, req *http.Request, framed
 	return base.RoundTrip(plainCopy(req, framed))
 }
 
+// resendBytes is the body in the client's zstd: its own bytes unless images
+// were rewritten, which they would undo.
+func (f *framedRequest) resendBytes() []byte {
+	if f.orig != nil {
+		return f.orig
+	}
+	f.recode.Do(func() {
+		if f.body == nil {
+			// done dropped the body: a resend now would carry nothing.
+			panic("dedup: resend of a request already answered")
+		}
+		f.recoded = encodeZstd(f.body)
+	})
+	return f.recoded
+}
+
+// plainCopy is req carrying the body itself, in the coding the client sent.
 func plainCopy(req *http.Request, framed *framedRequest) *http.Request {
 	plain := req.Clone(req.Context())
-	plain.Body = &releasingBody{b: framed.body}
-	plain.ContentLength = int64(len(framed.body))
+	body := framed.body
+	if framed.coding == codingZstd {
+		body = framed.resendBytes()
+		plain.Header.Set("Content-Encoding", codingZstd)
+	}
+	plain.Body = &releasingBody{b: body}
+	plain.ContentLength = int64(len(body))
 	plain.GetBody = nil
-	for _, h := range []string{hdrFrame, hdrLen, hdrEpoch} {
+	for _, h := range []string{hdrFrame, hdrLen, hdrEpoch, hdrCoding} {
 		plain.Header.Del(h)
 	}
 	return plain
@@ -606,6 +691,10 @@ func (e *encoder) snapshot() map[string]any {
 		"fallbacks": e.stats.fallbacks.Load(), "busy": e.stats.busy.Load(), "inflight_bytes": e.inflight.used.Load(),
 		"original_bytes": orig, "sent_bytes": sent, "ref_bytes": e.stats.refBytes.Load(), "ratio": ratio,
 		"index_entries": entries, "index_bytes": used,
+		// zstd bodies framed after decoding, the bytes they came as, and
+		// those passed on undecoded; zstd_ok while the decoder restores zstd.
+		"zstd": e.stats.zstd.Load(), "zstd_bytes": e.stats.zstdBytes.Load(),
+		"zstd_passed": e.stats.zstdPassed.Load(), "zstd_ok": e.zstdOK.Load(),
 	}
 	if e.images != nil {
 		snap["images"] = e.images.snapshot()
@@ -702,6 +791,7 @@ func (d *decoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if d.h2c {
 			w.Header().Set(hdrH2C, "1")
 		}
+		w.Header().Set(hdrCodings, codingZstd)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	} else if d.hosts != nil && !d.hosts.match(host) {
@@ -719,23 +809,22 @@ func (d *decoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Header.Get(hdrFrame) != "1" {
 		d.stats.plain.Add(1)
+		r.Header.Del(hdrCoding)
 		d.forward(w, r)
 		return
 	}
 	want, err := strconv.Atoi(r.Header.Get(hdrLen))
-	if err != nil || want <= 0 || int64(want) > d.maxBody {
-		d.reject(w, r, "bad dedup length", err)
-		return
+	var held *share
+	if err != nil || want <= 0 || int64(want) > d.maxBody || r.ContentLength <= 0 || r.ContentLength > d.maxFrame {
+		// Not a frame this decoder takes (its -max-body-mib may be below
+		// the encoder's).
+		d.stats.tooLarge.Add(1)
+	} else if held = d.inflight.take(r.ContentLength + int64(want) + requestOverhead); held == nil {
+		d.stats.busy.Add(1)
 	}
-	if r.ContentLength <= 0 || r.ContentLength > d.maxFrame {
-		d.reject(w, r, "bad dedup frame length", nil)
-		return
-	}
-	held := d.inflight.take(r.ContentLength + int64(want) + requestOverhead)
 	if held == nil {
 		// Missing nothing: the encoder resends the original, which streams
 		// through unbuffered. Draining keeps the connection usable.
-		d.stats.busy.Add(1)
 		io.Copy(io.Discard, r.Body)
 		w.Header().Set(hdrMissing, "0")
 		w.WriteHeader(http.StatusConflict)
@@ -769,9 +858,20 @@ func (d *decoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	d.stats.framed.Add(1)
 	d.stats.original.Add(int64(len(body)))
 	d.stats.sent.Add(int64(len(frame)))
+	switch coding := r.Header.Get(hdrCoding); coding {
+	case "":
+	case codingZstd:
+		// The client sent zstd: so does the origin get it.
+		// held keeps covering the plain body's size until the answer.
+		body = encodeZstd(body)
+		r.Header.Set("Content-Encoding", codingZstd)
+		d.stats.zstdRestored.Add(1)
+	default:
+		log.Printf("unknown dedup coding %q; sending the body plain", coding)
+	}
 	r.Body = &releasingBody{b: body, done: held.free}
 	r.ContentLength = int64(len(body))
-	for _, h := range []string{hdrFrame, hdrLen, hdrEpoch} {
+	for _, h := range []string{hdrFrame, hdrLen, hdrEpoch, hdrCoding} {
 		r.Header.Del(h)
 	}
 	d.forward(w, r)
@@ -783,6 +883,7 @@ func (d *decoder) snapshot() map[string]any {
 		"role": "decode", "epoch": d.epoch, "framed": d.stats.framed.Load(), "plain": d.stats.plain.Load(),
 		"missing_refs": d.misses.Load(), "busy": d.stats.busy.Load(), "inflight_bytes": d.inflight.used.Load(),
 		"original_bytes": d.stats.original.Load(), "frame_bytes": d.stats.sent.Load(),
-		"cache_entries": entries, "cache_bytes": used,
+		"cache_entries": entries, "cache_bytes": used, "zstd_restored": d.stats.zstdRestored.Load(),
+		"too_large": d.stats.tooLarge.Load(),
 	}
 }
