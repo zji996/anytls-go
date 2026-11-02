@@ -56,7 +56,7 @@ func waitIdle(t *testing.T, s *imageShadow) {
 
 func TestImageShadowTranscodesEachImageOnceAndAccountsResends(t *testing.T) {
 	var calls atomic.Int64
-	s := newImageShadow(90, 1, 16, 64, halfTranscoder(&calls))
+	s := newImageShadow(90, 1, 1<<20, 64, halfTranscoder(&calls))
 	images := []string{image(200 << 10), image(200 << 10)}
 	first := conversation(1, images[:1])
 	second := conversation(2, images)
@@ -90,7 +90,7 @@ func TestImageShadowTranscodesEachImageOnceAndAccountsResends(t *testing.T) {
 func TestImageShadowKeepsOriginalsThatBarelyShrinkOrFail(t *testing.T) {
 	small := image(100 << 10)
 	broken := image(100 << 10)
-	s := newImageShadow(90, 1, 16, 64, func(b64 []byte) ([]byte, error) {
+	s := newImageShadow(90, 1, 1<<20, 64, func(b64 []byte) ([]byte, error) {
 		if bytes.Equal(b64, []byte(strings.TrimPrefix(broken, "data:image/png;base64,"))) {
 			return nil, errors.New("not a PNG")
 		}
@@ -109,7 +109,7 @@ func TestImageShadowKeepsOriginalsThatBarelyShrinkOrFail(t *testing.T) {
 
 func TestImageShadowSkipsSmallAndOtherFormatsAndDropsWhenBusy(t *testing.T) {
 	block := make(chan struct{})
-	s := newImageShadow(90, 1, 1, 64, func(b64 []byte) ([]byte, error) {
+	s := newImageShadow(90, 1, 150<<10, 64, func(b64 []byte) ([]byte, error) {
 		<-block
 		return b64[:1], nil
 	})
@@ -117,13 +117,19 @@ func TestImageShadowSkipsSmallAndOtherFormatsAndDropsWhenBusy(t *testing.T) {
 	jpeg := strings.Replace(image(100<<10), "image/png", "image/jpeg", 1)
 	s.observe(conversation(3, []string{image(10 << 10), jpeg, image(100 << 10)}))
 	// Wait until the worker holds the first image and the queue is empty.
-	for deadline := time.Now().Add(5 * time.Second); len(s.jobs) > 0; {
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		s.mu.Lock()
+		queued := s.queued
+		s.mu.Unlock()
+		if queued == 0 {
+			break
+		}
 		if time.Now().After(deadline) {
 			t.Fatal("the worker never took the first image")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	// One slot left in the queue: of two more new images one is dropped.
+	// The queue holds 150 KiB: of two more new images one is dropped.
 	s.observe(conversation(2, []string{image(100 << 10), image(100 << 10)}))
 	snap := s.snapshot()
 	if snap["small"] != int64(1) || snap["other_format"] != int64(1) {
@@ -146,12 +152,47 @@ func TestParseImagesModes(t *testing.T) {
 	if _, err := parseImages("shadow", 0, 1); err == nil {
 		t.Fatal("quality 0 must be rejected")
 	}
+	for _, workers := range []int{0, 65} {
+		if _, err := parseImages("shadow", 85, workers); err == nil {
+			t.Fatalf("%d workers must be rejected", workers)
+		}
+	}
+}
+
+func TestImageShadowWorkersTranscodeInParallel(t *testing.T) {
+	const workers = 4
+	var running atomic.Int64
+	started := make(chan struct{}, workers)
+	release := make(chan struct{})
+	s := newImageShadow(85, workers, 1<<20, 64, func(b64 []byte) ([]byte, error) {
+		running.Add(1)
+		started <- struct{}{}
+		<-release
+		return b64[:1], nil
+	})
+	images := make([]string, workers)
+	for i := range images {
+		images[i] = image(100 << 10)
+	}
+	s.observe(conversation(len(images), images))
+	for range workers {
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%d of %d images being transcoded at once", running.Load(), workers)
+		}
+	}
+	close(release)
+	waitIdle(t, s)
+	if snap := s.snapshot(); snap["distinct"] != int64(workers) || snap["workers"] != workers {
+		t.Fatalf("want %d distinct by %d workers: %v", workers, workers, snap)
+	}
 }
 
 func TestShadowLeavesRequestsThroughTheChainUnchanged(t *testing.T) {
 	c := newReverseChain(t)
 	var calls atomic.Int64
-	c.enc.images = newImageShadow(90, 1, 16, 64, halfTranscoder(&calls))
+	c.enc.images = newImageShadow(90, 1, 1<<20, 64, halfTranscoder(&calls))
 	images := []string{image(200 << 10), image(200 << 10)}
 	for turn := 1; turn <= 2; turn++ {
 		body := conversation(turn, images)
@@ -175,7 +216,7 @@ func TestShadowLeavesRequestsThroughTheChainUnchanged(t *testing.T) {
 // largest seen in production: 24 screenshots of about 550 KiB, all known.
 func BenchmarkImageShadowObserve(b *testing.B) {
 	var calls atomic.Int64
-	s := newImageShadow(90, 1, 64, 1024, halfTranscoder(&calls))
+	s := newImageShadow(90, 1, 64<<20, 1024, halfTranscoder(&calls))
 	images := make([]string, 24)
 	for i := range images {
 		images[i] = image(410 << 10)

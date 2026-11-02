@@ -5,6 +5,7 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +28,11 @@ const (
 // imageMaxDecodeMiB is the memory budget per transcode worker: one decoded
 // image, its WebP and buffers.
 const imageMaxDecodeMiB = 200
+
+// imageQueueMiB bounds the copies of new images waiting for a worker. A
+// restart empties the size cache, and the first busy minutes then bring dozens
+// of new screenshots at once.
+const imageQueueMiB = 64
 
 // imageMinB64 skips icons and thumbnails: transcoding them saves too little.
 const imageMinB64 = 64 << 10
@@ -101,23 +107,29 @@ type imageJob struct {
 
 // imageShadow measures what WebP would save without changing a request.
 type imageShadow struct {
-	quality   int
-	transcode transcodeFunc
-	jobs      chan imageJob
-	stats     imageCounters
+	quality, workers int
+	transcode        transcodeFunc
+	jobs             chan imageJob
+	stats            imageCounters
 
-	mu      sync.Mutex
-	sizes   *sizeLRU          // sha256 of the payload -> base64 bytes it would send
-	pending map[[32]byte]bool // queued or being transcoded
+	mu         sync.Mutex
+	sizes      *sizeLRU          // sha256 of the payload -> base64 bytes it would send
+	pending    map[[32]byte]bool // queued or being transcoded
+	queued     int               // bytes of the payloads in jobs
+	queueLimit int
 }
 
-func newImageShadow(quality, workers, queue, entries int, transcode transcodeFunc) *imageShadow {
+// newImageShadow starts workers that transcode new images, with up to
+// queueBytes of them waiting.
+func newImageShadow(quality, workers, queueBytes, entries int, transcode transcodeFunc) *imageShadow {
 	s := &imageShadow{
-		quality:   quality,
-		transcode: transcode,
-		jobs:      make(chan imageJob, queue),
-		sizes:     newSizeLRU(entries),
-		pending:   make(map[[32]byte]bool),
+		quality:    quality,
+		workers:    workers,
+		transcode:  transcode,
+		jobs:       make(chan imageJob, queueBytes/imageMinB64+1),
+		sizes:      newSizeLRU(entries),
+		pending:    make(map[[32]byte]bool),
+		queueLimit: queueBytes,
 	}
 	for range workers {
 		go s.work()
@@ -147,11 +159,16 @@ func (s *imageShadow) observe(body []byte) {
 		size, ok := s.sizes.get(key)
 		queued := s.pending[key]
 		if !ok && !queued {
-			select {
-			case s.jobs <- imageJob{key: key, b64: bytes.Clone(b64)}:
-				s.pending[key] = true
-			default:
+			if s.queued+len(b64) > s.queueLimit {
 				s.stats.busy.Add(1)
+			} else {
+				select {
+				case s.jobs <- imageJob{key: key, b64: bytes.Clone(b64)}:
+					s.pending[key] = true
+					s.queued += len(b64)
+				default:
+					s.stats.busy.Add(1)
+				}
 			}
 		}
 		s.mu.Unlock()
@@ -163,8 +180,15 @@ func (s *imageShadow) observe(body []byte) {
 	}
 }
 
+// work runs on a thread of its own at a lower CPU priority, so that the
+// request path, Caddy and frps on the same cores come first.
 func (s *imageShadow) work() {
+	runtime.LockOSThread()
+	lowerThreadPriority()
 	for job := range s.jobs {
+		s.mu.Lock()
+		s.queued -= len(job.b64)
+		s.mu.Unlock()
 		size := s.measure(job.b64)
 		s.mu.Lock()
 		delete(s.pending, job.key)
@@ -219,7 +243,7 @@ func (s *imageShadow) snapshot() map[string]any {
 		"distinct_ratio": ratio(st.distinctBytes.Load(), st.distinctWebp.Load()),
 		"kept":           st.kept.Load(), "failed": st.failed.Load(), "busy": st.busy.Load(),
 		"small": st.small.Load(), "other_format": st.otherFormat.Load(), "other_format_bytes": st.otherBytes.Load(),
-		"transcode_ms_avg": avgMs, "queued": len(s.jobs),
+		"transcode_ms_avg": avgMs, "queued": len(s.jobs), "workers": s.workers,
 	}
 }
 
@@ -235,14 +259,14 @@ func parseImages(mode string, quality, workers int) (*imageShadow, error) {
 	if quality < 1 || quality > 100 {
 		return nil, fmt.Errorf("bad -images-quality %d: want 1..100", quality)
 	}
-	if workers < 1 {
-		return nil, fmt.Errorf("bad -images-workers %d: want at least 1", workers)
+	if workers < 1 || workers > 64 {
+		return nil, fmt.Errorf("bad -images-workers %d: want 1..64", workers)
 	}
 	transcode, err := webpTranscoder(quality)
 	if err != nil {
 		return nil, err
 	}
-	return newImageShadow(quality, workers, 16, 1<<16, transcode), nil
+	return newImageShadow(quality, workers, imageQueueMiB<<20, 1<<16, transcode), nil
 }
 
 // sizeLRU remembers a size per key, dropping the least recently used past cap.

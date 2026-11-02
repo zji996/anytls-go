@@ -16,6 +16,11 @@ import (
 // from loading a system libwebp instead: another version could encode the
 // same image to other bytes, and every host must agree byte for byte.
 
+// webpMethod trades encoding effort for size, 0..6. On screenshots method 2
+// takes about 40% of the time of method 4 for 3-5% more bytes; from 3 up
+// libwebp adds its slow rate-distortion passes.
+const webpMethod = 2
+
 // imageMaxPixels bounds the memory one decode may take (4 bytes a pixel).
 const imageMaxPixels = 40 << 20
 
@@ -25,7 +30,7 @@ const webpMaxSide = 16383
 var errAnimated = errors.New("animated PNG")
 
 func webpTranscoder(quality int) (transcodeFunc, error) {
-	opts := webp.Options{Quality: quality, Method: 4}
+	opts := webp.Options{Quality: quality, Method: webpMethod}
 	return func(b64 []byte) ([]byte, error) {
 		raw := make([]byte, base64.StdEncoding.DecodedLen(len(b64)))
 		n, err := base64.StdEncoding.Decode(raw, b64)

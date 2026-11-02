@@ -8,6 +8,7 @@ import (
 	stdimage "image"
 	"image/color"
 	stdpng "image/png"
+	"sync"
 	"testing"
 
 	"github.com/gen2brain/webp"
@@ -55,6 +56,30 @@ func TestWebpTranscoderIsDeterministicAndSmaller(t *testing.T) {
 	cfg, err := webp.DecodeConfig(bytes.NewReader(raw))
 	if err != nil || cfg.Width != 640 || cfg.Height != 400 {
 		t.Fatalf("output is not a 640x400 WebP: %+v %v", cfg, err)
+	}
+}
+
+func TestWebpTranscoderAgreesWithItselfAcrossWorkers(t *testing.T) {
+	transcode, _ := webpTranscoder(85)
+	in := base64.StdEncoding.AppendEncode(nil, screenshot(800, 500))
+	want, err := transcode(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	outs := make([][]byte, 4)
+	for i := range outs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			outs[i], _ = transcode(in)
+		}()
+	}
+	wg.Wait()
+	for i, out := range outs {
+		if !bytes.Equal(out, want) {
+			t.Fatalf("worker %d encoded the same PNG to other bytes", i)
+		}
 	}
 }
 

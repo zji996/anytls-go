@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -42,8 +43,8 @@ func runEncode(args []string) {
 	probe := fs.Duration("probe-interval", 5*time.Second, "decoder health check interval")
 	drain := fs.Duration("drain", 30*time.Second, "on SIGTERM, time for open requests to finish")
 	imagesFlag := fs.String("images", imagesOff, "PNG data URLs: off, or shadow (measure what WebP would save; requests are not changed)")
-	imagesQuality := fs.Int("images-quality", 90, "WebP quality the shadow measures")
-	imagesWorkers := fs.Int("images-workers", 1, "background transcodes at a time")
+	imagesQuality := fs.Int("images-quality", 85, "WebP quality the shadow measures")
+	imagesWorkers := fs.Int("images-workers", 4, "background transcodes at a time, each on a thread of lower CPU priority")
 	fs.Parse(args)
 	if *listen == "" || *upstream == "" {
 		log.Fatal("-listen and -upstream are required")
@@ -64,11 +65,18 @@ func runEncode(args []string) {
 		*memoryMiB = *indexMiB/8 + *inflightMiB + 64
 		if images != nil {
 			// Queued copies plus one decoded image per worker.
-			*memoryMiB += 64 + int64(*imagesWorkers)*imageMaxDecodeMiB
+			*memoryMiB += imageQueueMiB + int64(*imagesWorkers)*imageMaxDecodeMiB
 		}
 	}
 	setMemoryLimit(*memoryMiB)
 	preferOOMKill(*oomScore)
+	if images != nil && os.Getenv("GOMAXPROCS") == "" {
+		// A busy image worker holds a Go P. One more P per worker keeps the
+		// request path from queueing behind them; the cores then go where
+		// the kernel sends them, and the workers' nice value sends them to
+		// the request path, Caddy and frps first.
+		runtime.GOMAXPROCS(runtime.GOMAXPROCS(0) + *imagesWorkers)
+	}
 
 	enc := newEncoder(route{url: up}, *indexMiB<<20, *maxBodyMiB<<20)
 	enc.inflight = &budget{limit: *inflightMiB << 20}
