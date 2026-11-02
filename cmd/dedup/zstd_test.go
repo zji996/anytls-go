@@ -333,7 +333,7 @@ func TestResendBytesAreMadeOnce(t *testing.T) {
 	f := &framedRequest{body: repetitive(1 << 20), coding: codingZstd}
 	outs := make(chan []byte, 4)
 	for range 4 {
-		go func() { outs <- f.resendBytes() }()
+		go func() { b, _ := f.resendBytes(); outs <- b }()
 	}
 	first := <-outs
 	for range 3 {
@@ -385,13 +385,51 @@ func TestZstdStreamsDecodeAtEverySize(t *testing.T) {
 	}
 }
 
-func TestResendAfterTheAnswerPanics(t *testing.T) {
+func TestResendAfterTheAnswerIsRefusedEveryTime(t *testing.T) {
 	f := &framedRequest{body: repetitive(64 << 10), coding: codingZstd, held: (&budget{}).take(0), known: newLRU(1 << 20)}
+	req, _ := http.NewRequest(http.MethodPost, "http://a.example/", nil)
 	f.done()
-	defer func() {
-		if recover() == nil {
-			t.Fatal("a resend after done must not send an empty body")
+	for range 2 {
+		if b, ok := f.resendBytes(); ok || b != nil {
+			t.Fatal("a resend after done must not carry a body")
 		}
-	}()
-	f.resendBytes()
+		if plain, err := plainCopy(req, f); err == nil || plain != nil {
+			t.Fatal("a resend after done must fail, not send an empty body")
+		}
+	}
+}
+
+func TestZstdGarbageCostsNoMoreThanTheFirstGuess(t *testing.T) {
+	e := newEncoder(route{url: mustURL(t, "http://127.0.0.1:1")}, 1<<20, 64<<20)
+	e.inflight = &budget{limit: 1 << 30}
+	raw := bytes.Repeat([]byte("not zstd at all "), 1<<16) // 1 MiB
+	held := e.inflight.take(2*int64(len(raw)) + requestOverhead)
+	before := e.inflight.used.Load()
+	peak := int64(0)
+	if _, ok := e.decodeZstd(context.Background(), raw, held); ok {
+		t.Fatal("garbage must not decode")
+	}
+	peak = e.inflight.used.Load() - before
+	// The first attempt at 4x: 2*(4-1/2) times raw, and no doubling after.
+	if limit := int64(7 * len(raw)); peak > limit {
+		t.Fatalf("garbage grew the budget by %d MiB, want at most %d", peak>>20, limit>>20)
+	}
+	held.free()
+}
+
+func TestZstdKeepsOnlyWhatTheBodyNeeds(t *testing.T) {
+	e := newEncoder(route{url: mustURL(t, "http://127.0.0.1:1")}, 1<<20, 64<<20)
+	e.inflight = &budget{limit: 1 << 30}
+	// Screenshots barely compress: the 4x guess is far too generous.
+	plain := conversation(4, []string{image(400 << 10), image(400 << 10), image(400 << 10), image(400 << 10)})
+	raw := zstdStream(t, plain)
+	held := e.inflight.take(2*int64(len(raw)) + requestOverhead)
+	body, ok := e.decodeZstd(context.Background(), raw, held)
+	if !ok || !bytes.Equal(body, plain) {
+		t.Fatal("decode failed")
+	}
+	if got, want := e.inflight.used.Load(), 2*int64(len(body))+int64(len(raw))+requestOverhead; got != want {
+		t.Fatalf("holding %d bytes after decoding, want %d", got, want)
+	}
+	held.free()
 }

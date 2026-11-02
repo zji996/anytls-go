@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -188,13 +189,13 @@ type framedRequest struct {
 	coding string
 	orig   []byte
 	// recoded is body compressed again for a resend once images were
-	// rewritten; resendBytes makes it at most once.
-	recode  sync.Once
-	recoded []byte
-	lits    []digest
-	held    *share
-	known   *lru
-	settled sync.Once
+	// rewritten; resendBytes makes it at most once, under recodeMu.
+	recodeMu sync.Mutex
+	recoded  []byte
+	lits     []digest
+	held     *share
+	known    *lru
+	settled  sync.Once
 }
 
 // settle ends the frame's claims on its literals, once: held if the decoder
@@ -539,7 +540,11 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		e.known.settle(res.litHashes, false)
 		log.Printf("encode: %v; sending plain", err)
 		e.stats.plain.Add(1)
-		plain := plainCopy(r, framed)
+		plain, err := plainCopy(r, framed)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
 		e.proxy.ServeHTTP(w, plain)
 		return
 	}
@@ -585,10 +590,11 @@ func (e *encoder) send(base http.RoundTripper, req *http.Request, framed *framed
 		}
 		if framed != nil && e.origin != nil && req.Context().Err() == nil {
 			// The body is still here; without a decoder only the origin is left.
-			e.stats.fallbacks.Add(1)
-			direct := plainCopy(req, framed)
-			direct.URL.Scheme, direct.URL.Host = "https", req.Host
-			return e.origin.RoundTrip(direct)
+			if direct, perr := plainCopy(req, framed); perr == nil {
+				e.stats.fallbacks.Add(1)
+				direct.URL.Scheme, direct.URL.Host = "https", req.Host
+				return e.origin.RoundTrip(direct)
+			}
 		}
 		return resp, err
 	}
@@ -622,7 +628,7 @@ func (e *encoder) send(base http.RoundTripper, req *http.Request, framed *framed
 	}
 	e.learnEpoch(resp.Header.Get(hdrEpoch))
 	e.stats.retries.Add(1)
-	return base.RoundTrip(plainCopy(req, framed))
+	return e.resend(base, req, framed)
 }
 
 // misdelivered handles a frame answered without a decoder epoch. A 4xx means
@@ -642,31 +648,53 @@ func (e *encoder) misdelivered(base http.RoundTripper, req *http.Request, framed
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	e.stats.misdelivered.Add(1)
-	return base.RoundTrip(plainCopy(req, framed))
+	return e.resend(base, req, framed)
 }
 
-// resendBytes is the body in the client's zstd: its own bytes unless images
-// were rewritten, which they would undo.
-func (f *framedRequest) resendBytes() []byte {
-	if f.orig != nil {
-		return f.orig
+// resend sends the body itself in place of the frame.
+func (e *encoder) resend(base http.RoundTripper, req *http.Request, framed *framedRequest) (*http.Response, error) {
+	plain, err := plainCopy(req, framed)
+	if err != nil {
+		return nil, err
 	}
-	f.recode.Do(func() {
+	return base.RoundTrip(plain)
+}
+
+// errAnswered is a resend asked for after the request was answered, when its
+// body is gone.
+var errAnswered = errors.New("dedup: resend of a request already answered")
+
+// resendBytes is the body in the client's zstd: its own bytes unless images
+// were rewritten, which they would undo. ok is false once done dropped the
+// body.
+func (f *framedRequest) resendBytes() ([]byte, bool) {
+	if f.orig != nil {
+		return f.orig, true
+	}
+	f.recodeMu.Lock()
+	defer f.recodeMu.Unlock()
+	if f.recoded == nil {
 		if f.body == nil {
-			// done dropped the body: a resend now would carry nothing.
-			panic("dedup: resend of a request already answered")
+			return nil, false
 		}
 		f.recoded = encodeZstd(f.body)
-	})
-	return f.recoded
+	}
+	return f.recoded, true
 }
 
 // plainCopy is req carrying the body itself, in the coding the client sent.
-func plainCopy(req *http.Request, framed *framedRequest) *http.Request {
+// It fails once done has dropped the body: never a request with none.
+func plainCopy(req *http.Request, framed *framedRequest) (*http.Request, error) {
+	if framed.body == nil {
+		return nil, errAnswered
+	}
 	plain := req.Clone(req.Context())
 	body := framed.body
 	if framed.coding == codingZstd {
-		body = framed.resendBytes()
+		var ok bool
+		if body, ok = framed.resendBytes(); !ok {
+			return nil, errAnswered
+		}
 		plain.Header.Set("Content-Encoding", codingZstd)
 	}
 	plain.Body = &releasingBody{b: body}
@@ -675,7 +703,7 @@ func plainCopy(req *http.Request, framed *framedRequest) *http.Request {
 	for _, h := range []string{hdrFrame, hdrLen, hdrEpoch, hdrCoding} {
 		plain.Header.Del(h)
 	}
-	return plain
+	return plain, nil
 }
 
 func (e *encoder) snapshot() map[string]any {
