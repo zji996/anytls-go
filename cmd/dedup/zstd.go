@@ -109,10 +109,6 @@ func zstdSize(raw []byte) int64 {
 // make the encoder reserve more than this per byte received.
 const zstdMaxRatio = 64
 
-// zstdBlockMax is the largest zstd block: an attempt that ran out of room
-// stopped within one of its end.
-const zstdBlockMax = 128 << 10
-
 // zstdGuessRatio sizes the first attempt at a body that does not declare its
 // decoded size (streaming encoders, such as Codex's, leave it out): Codex's
 // JSON with screenshots decodes to 2-5 times its size.
@@ -154,9 +150,9 @@ func (e *encoder) decodeZstd(ctx context.Context, raw []byte, held *share) (body
 			return body, true
 		}
 		// Out of room shows as more than one error, always with the output
-		// filled close to its capacity (within a block). Anything short of
-		// that is a body that does not decode at any size.
-		if size >= bound || len(body)+zstdBlockMax < int(size) && len(body) < int(size)/2 {
+		// filled to its capacity; one that stopped short of half of it is a
+		// body that does not decode at any size.
+		if size >= bound || len(body) < int(size)/2 {
 			return nil, false
 		}
 		size = min(bound, 2*size)

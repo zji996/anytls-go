@@ -402,19 +402,19 @@ func TestResendAfterTheAnswerIsRefusedEveryTime(t *testing.T) {
 func TestZstdGarbageCostsNoMoreThanTheFirstGuess(t *testing.T) {
 	e := newEncoder(route{url: mustURL(t, "http://127.0.0.1:1")}, 1<<20, 64<<20)
 	e.inflight = &budget{limit: 1 << 30}
-	raw := bytes.Repeat([]byte("not zstd at all "), 1<<16) // 1 MiB
-	held := e.inflight.take(2*int64(len(raw)) + requestOverhead)
-	before := e.inflight.used.Load()
-	peak := int64(0)
-	if _, ok := e.decodeZstd(context.Background(), raw, held); ok {
-		t.Fatal("garbage must not decode")
+	for _, n := range []int{4 << 10, 32 << 10, 1 << 20} {
+		raw := bytes.Repeat([]byte("not zstd at all "), n/16)
+		held := e.inflight.take(2*int64(len(raw)) + requestOverhead)
+		before := e.inflight.used.Load()
+		if _, ok := e.decodeZstd(context.Background(), raw, held); ok {
+			t.Fatal("garbage must not decode")
+		}
+		// The first attempt at 4x: 2*(4-1/2) times raw, and no doubling after.
+		if grown, limit := e.inflight.used.Load()-before, int64(7*len(raw)); grown > limit {
+			t.Fatalf("%d bytes of garbage grew the budget by %d, want at most %d", len(raw), grown, limit)
+		}
+		held.free()
 	}
-	peak = e.inflight.used.Load() - before
-	// The first attempt at 4x: 2*(4-1/2) times raw, and no doubling after.
-	if limit := int64(7 * len(raw)); peak > limit {
-		t.Fatalf("garbage grew the budget by %d MiB, want at most %d", peak>>20, limit>>20)
-	}
-	held.free()
 }
 
 func TestZstdKeepsOnlyWhatTheBodyNeeds(t *testing.T) {
