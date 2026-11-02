@@ -158,8 +158,10 @@ type encoder struct {
 	// decoder cannot be reached.
 	origin   http.RoundTripper
 	compress compression
-	// images, if set, measures what re-encoding screenshots would save.
-	images *imageShadow
+	// images, if set, measures (shadow) or applies (webp) re-encoding
+	// screenshots. It only sees requests that are framed: one that passes
+	// through plain (decoder down, body too large, no memory) keeps its PNGs.
+	images *imageStage
 }
 
 // A path with no decoder (frpc pointed straight at the origin) answers without
@@ -470,7 +472,7 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if e.images != nil {
-		e.images.observe(body)
+		body = e.images.process(r.Context(), body)
 	}
 	res, err := encodeFrame(body, e.known, e.compress)
 	if err != nil {
@@ -478,6 +480,7 @@ func (e *encoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("encode: %v; sending plain", err)
 		e.stats.plain.Add(1)
 		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
 		e.proxy.ServeHTTP(w, r)
 		return
 	}

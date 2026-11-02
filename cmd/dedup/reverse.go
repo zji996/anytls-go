@@ -42,8 +42,9 @@ func runEncode(args []string) {
 	compressFlag := fs.String("compress", "auto", "CPU for content the decoder lacks: auto, huffman (cheaper) or off (cache only)")
 	probe := fs.Duration("probe-interval", 5*time.Second, "decoder health check interval")
 	drain := fs.Duration("drain", 30*time.Second, "on SIGTERM, time for open requests to finish")
-	imagesFlag := fs.String("images", imagesOff, "PNG data URLs: off, or shadow (measure what WebP would save; requests are not changed)")
-	imagesQuality := fs.Int("images-quality", 85, "WebP quality the shadow measures")
+	imagesFlag := fs.String("images", imagesOff, "PNG data URLs: off, shadow (measure what WebP would save; requests are not changed) or webp (send them as WebP)")
+	imagesQuality := fs.Int("images-quality", 85, "WebP quality; every encoder in front of one origin must use the same")
+	imagesWait := fs.Duration("images-wait", 1500*time.Millisecond, "webp: how long a request waits for its new images; later ones go as PNG and stay PNG")
 	imagesWorkers := fs.Int("images-workers", 4, "background transcodes at a time, each on a thread of lower CPU priority")
 	fs.Parse(args)
 	if *listen == "" || *upstream == "" {
@@ -57,15 +58,18 @@ func runEncode(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	images, err := parseImages(*imagesFlag, *imagesQuality, *imagesWorkers)
+	images, err := parseImages(*imagesFlag, *imagesQuality, *imagesWorkers, *imagesWait)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if *memoryMiB == 0 {
 		*memoryMiB = *indexMiB/8 + *inflightMiB + 64
 		if images != nil {
-			// Queued copies plus one decoded image per worker.
+			// Queued copies, one decoded image per worker, and the WebPs kept.
 			*memoryMiB += imageQueueMiB + int64(*imagesWorkers)*imageMaxDecodeMiB
+			if images.mode == imagesWebp {
+				*memoryMiB += imageCacheMiB
+			}
 		}
 	}
 	setMemoryLimit(*memoryMiB)

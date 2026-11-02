@@ -4,12 +4,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	stdimage "image"
 	"image/color"
 	stdpng "image/png"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gen2brain/webp"
 )
@@ -97,5 +99,30 @@ func TestWebpTranscoderRejectsWhatItMustNotTouch(t *testing.T) {
 		if _, err := transcode(in); err == nil {
 			t.Errorf("%s: want an error", name)
 		}
+	}
+}
+
+func TestWebpStageSendsARealWebp(t *testing.T) {
+	transcode, _ := webpTranscoder(85)
+	s := newImageStage(imageConfig{mode: imagesWebp, quality: 85, workers: 2, wait: 10 * time.Second,
+		queueBytes: 64 << 20, cacheBytes: 64 << 20}, transcode)
+	png := "data:image/png;base64," + base64.StdEncoding.EncodeToString(screenshot(800, 500))
+	body := []byte(`{"input":[{"type":"input_image","image_url":"` + png + `"}]}`)
+	got := s.process(context.Background(), body)
+	imgs := findDataImages(got)
+	if len(imgs) != 1 || imgs[0].mime != "webp" {
+		t.Fatalf("want one WebP data URL, got %+v (stats %v)", imgs, s.snapshot())
+	}
+	raw, err := base64.StdEncoding.DecodeString(string(got[imgs[0].start:imgs[0].end]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := webp.DecodeConfig(bytes.NewReader(raw))
+	if err != nil || cfg.Width != 800 || cfg.Height != 500 {
+		t.Fatalf("not an 800x500 WebP: %+v %v", cfg, err)
+	}
+	if !bytes.HasPrefix(got, []byte(`{"input":[{"type":"input_image","image_url":"data:image/webp;base64,`)) ||
+		!bytes.HasSuffix(got, []byte(`"}]}`)) {
+		t.Fatal("the JSON around the image changed")
 	}
 }

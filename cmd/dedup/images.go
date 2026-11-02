@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"runtime"
@@ -11,11 +12,18 @@ import (
 	"time"
 )
 
-// Image shadow: agents attach screenshots as base64 PNG data URLs and resend
-// every one of them each turn. Re-encoding them as WebP before the tunnel
-// would shrink what crosses it; the shadow mode only measures by how much. It
-// leaves every request untouched: the request path finds the images and looks
-// up sizes already known, and a small background pool transcodes new ones.
+// Images: agents attach screenshots as base64 PNG data URLs and resend every
+// one of them each turn. Re-encoding them as WebP before the tunnel shrinks
+// what crosses it and what the origin receives. A small background pool of
+// low-priority workers transcodes each new image once; the request path finds
+// the images and looks up results already known.
+//
+// shadow only measures: requests are left untouched and new images are queued
+// without waiting. webp swaps the WebP in. A request waits up to -images-wait
+// for its new images; one that is not ready by then, or that the queue could
+// not finish in time, goes out as PNG and stays PNG for as long as the cache
+// remembers it. An upstream prompt cache matches a conversation's resent
+// images byte for byte, so an image must not change form between turns.
 //
 // The codec lives behind the dedupimages build tag (see images_webp.go), so
 // builds without it, such as the router front, link no image code at all.
@@ -23,6 +31,7 @@ import (
 const (
 	imagesOff    = "off"
 	imagesShadow = "shadow"
+	imagesWebp   = "webp"
 )
 
 // imageMaxDecodeMiB is the memory budget per transcode worker: one decoded
@@ -36,6 +45,19 @@ const imageQueueMiB = 64
 
 // imageMinB64 skips icons and thumbnails: transcoding them saves too little.
 const imageMinB64 = 64 << 10
+
+// imageCacheMiB holds the WebPs of recent images in webp mode, about two
+// thousand screenshots. An image that falls out was not resent for long
+// enough that an upstream prompt cache has let it go too.
+const imageCacheMiB = 128
+
+// imageEntryBytes is what a cache entry costs besides its WebP. In shadow
+// mode, which keeps no WebP, it bounds the cache to 64Ki entries.
+const imageEntryBytes = 160
+
+// imageStartRate is the transcode speed assumed until one is measured, in
+// base64 bytes a second a worker: about 0.5 s for a 530 KiB screenshot.
+const imageStartRate = 1 << 20
 
 // imageKeepRatio is how small the WebP must be, relative to the PNG, to be
 // worth swapping in: a lossy copy of an image that barely shrinks is no gain.
@@ -88,7 +110,7 @@ func findDataImages(body []byte) []dataImage {
 
 type imageCounters struct {
 	// Every image occurrence the request path saw, and of those, the ones
-	// whose WebP size was already known (the rest were queued or dropped).
+	// whose result was already known (the rest were queued or dropped).
 	seen, seenBytes, known, knownBytes, knownWebp atomic.Int64
 	// small images and formats other than PNG, left alone.
 	small, otherFormat, otherBytes atomic.Int64
@@ -98,127 +120,353 @@ type imageCounters struct {
 	nanos                                 atomic.Int64
 	// Bytes of the bodies that were looked at, images or not.
 	bodies, bodyBytes atomic.Int64
+	// webp: occurrences sent as WebP and their PNG and WebP bytes; images
+	// left PNG because they were not ready in time (late) or would not have
+	// been (shed); requests that waited for new images, and for how long.
+	replaced, replacedBytes, replacedWebp atomic.Int64
+	late, shed                            atomic.Int64
+	waits, waitNanos, waitMaxNanos        atomic.Int64
+}
+
+// imageResult is what a request carries for one image.
+type imageResult struct {
+	size int    // base64 bytes: the WebP's, or the PNG's
+	webp []byte // base64 WebP to send instead; nil sends the PNG
 }
 
 type imageJob struct {
 	key [32]byte
 	b64 []byte
+	// done is closed once the result is in the cache, or the job is called
+	// off. Under mu: started once a worker took it, cancelled once called off.
+	done               chan struct{}
+	started, cancelled bool
 }
 
-// imageShadow measures what WebP would save without changing a request.
-type imageShadow struct {
+// imageStage measures (shadow) or applies (webp) WebP re-encoding.
+type imageStage struct {
+	mode             string
 	quality, workers int
+	wait             time.Duration
 	transcode        transcodeFunc
-	jobs             chan imageJob
+	jobs             chan *imageJob
 	stats            imageCounters
 
 	mu         sync.Mutex
-	sizes      *sizeLRU          // sha256 of the payload -> base64 bytes it would send
-	pending    map[[32]byte]bool // queued or being transcoded
-	queued     int               // bytes of the payloads in jobs
+	cache      *imageLRU // sha256 of the payload -> result
+	pending    map[[32]byte]*imageJob
+	queued     int // bytes of the payloads in jobs not yet started
 	queueLimit int
+	rate       float64 // base64 bytes a second a worker, smoothed
 }
 
-// newImageShadow starts workers that transcode new images, with up to
-// queueBytes of them waiting.
-func newImageShadow(quality, workers, queueBytes, entries int, transcode transcodeFunc) *imageShadow {
-	s := &imageShadow{
-		quality:    quality,
-		workers:    workers,
+type imageConfig struct {
+	mode             string
+	quality, workers int
+	wait             time.Duration // webp: how long a request waits for new images
+	queueBytes       int           // payloads waiting for a worker
+	cacheBytes       int
+}
+
+// newImageStage starts the workers.
+func newImageStage(c imageConfig, transcode transcodeFunc) *imageStage {
+	s := &imageStage{
+		mode:       c.mode,
+		quality:    c.quality,
+		workers:    c.workers,
+		wait:       c.wait,
 		transcode:  transcode,
-		jobs:       make(chan imageJob, queueBytes/imageMinB64+1),
-		sizes:      newSizeLRU(entries),
-		pending:    make(map[[32]byte]bool),
-		queueLimit: queueBytes,
+		jobs:       make(chan *imageJob, c.queueBytes/imageMinB64+1),
+		cache:      newImageLRU(c.cacheBytes),
+		pending:    make(map[[32]byte]*imageJob),
+		queueLimit: c.queueBytes,
+		rate:       imageStartRate,
 	}
-	for range workers {
+	for range c.workers {
 		go s.work()
 	}
 	return s
 }
 
-// observe accounts for the images in body. It neither changes nor keeps body.
-func (s *imageShadow) observe(body []byte) {
+// process is the request-path hook: it returns the body to send.
+func (s *imageStage) process(ctx context.Context, body []byte) []byte {
+	if s.mode == imagesWebp {
+		return s.rewrite(ctx, body)
+	}
+	s.observe(body)
+	return body
+}
+
+// pngImages lists the PNGs in body worth transcoding, counting the rest.
+func (s *imageStage) pngImages(body []byte) []dataImage {
 	s.stats.bodies.Add(1)
 	s.stats.bodyBytes.Add(int64(len(body)))
+	var out []dataImage
 	for _, img := range findDataImages(body) {
 		b64 := body[img.start:img.end]
-		if img.mime != "png" {
+		switch {
+		case img.mime != "png":
 			s.stats.otherFormat.Add(1)
 			s.stats.otherBytes.Add(int64(len(b64)))
-			continue
-		}
-		if len(b64) < imageMinB64 {
+		case len(b64) < imageMinB64:
 			s.stats.small.Add(1)
-			continue
+		default:
+			s.stats.seen.Add(1)
+			s.stats.seenBytes.Add(int64(len(b64)))
+			out = append(out, img)
 		}
-		s.stats.seen.Add(1)
-		s.stats.seenBytes.Add(int64(len(b64)))
+	}
+	return out
+}
+
+func (s *imageStage) countKnown(b64 []byte, r imageResult) {
+	s.stats.known.Add(1)
+	s.stats.knownBytes.Add(int64(len(b64)))
+	s.stats.knownWebp.Add(int64(r.size))
+}
+
+// enqueueLocked queues a transcode of b64, or returns nil when the queue is
+// full.
+func (s *imageStage) enqueueLocked(key [32]byte, b64 []byte) *imageJob {
+	if s.queued+len(b64) > s.queueLimit {
+		return nil
+	}
+	job := &imageJob{key: key, b64: bytes.Clone(b64), done: make(chan struct{})}
+	select {
+	case s.jobs <- job:
+	default:
+		return nil
+	}
+	s.pending[key] = job
+	s.queued += len(b64)
+	return job
+}
+
+// observe accounts for the images in body. It neither changes nor keeps body.
+func (s *imageStage) observe(body []byte) {
+	for _, img := range s.pngImages(body) {
+		b64 := body[img.start:img.end]
 		key := sha256.Sum256(b64)
 		s.mu.Lock()
-		size, ok := s.sizes.get(key)
-		queued := s.pending[key]
-		if !ok && !queued {
-			if s.queued+len(b64) > s.queueLimit {
-				s.stats.busy.Add(1)
-			} else {
-				select {
-				case s.jobs <- imageJob{key: key, b64: bytes.Clone(b64)}:
-					s.pending[key] = true
-					s.queued += len(b64)
-				default:
-					s.stats.busy.Add(1)
-				}
-			}
+		r, ok := s.cache.get(key)
+		if !ok && s.pending[key] == nil && s.enqueueLocked(key, b64) == nil {
+			s.stats.busy.Add(1)
 		}
 		s.mu.Unlock()
 		if ok {
-			s.stats.known.Add(1)
-			s.stats.knownBytes.Add(int64(len(b64)))
-			s.stats.knownWebp.Add(int64(size))
+			s.countKnown(b64, r)
 		}
 	}
+}
+
+// finishesInTimeLocked reports whether a new job of n bytes would be done within
+// left: the queue ahead is shared among the workers, the job itself is not.
+func (s *imageStage) finishesInTimeLocked(n int, left time.Duration) bool {
+	ahead := float64(s.queued) / (s.rate * float64(s.workers))
+	own := float64(n) / s.rate
+	return time.Duration((ahead+own)*float64(time.Second)) <= left
+}
+
+// settlePNGLocked fixes key as sent as PNG.
+func (s *imageStage) settlePNGLocked(key [32]byte, n int) {
+	s.cache.put(key, imageResult{size: n})
+}
+
+// rewrite returns body with each PNG whose WebP is ready by the deadline
+// swapped for that WebP. It never changes body itself.
+func (s *imageStage) rewrite(ctx context.Context, body []byte) []byte {
+	imgs := s.pngImages(body)
+	if len(imgs) == 0 {
+		return body
+	}
+	start := time.Now()
+	deadline := start.Add(s.wait)
+	keys := make([][32]byte, len(imgs))
+	results := make(map[[32]byte]imageResult, len(imgs))
+	waiting := make(map[[32]byte]*imageJob)
+	s.mu.Lock()
+	for i, img := range imgs {
+		b64 := body[img.start:img.end]
+		key := sha256.Sum256(b64)
+		keys[i] = key
+		if _, ok := results[key]; ok {
+			continue
+		}
+		if waiting[key] != nil {
+			continue
+		}
+		if r, ok := s.cache.get(key); ok {
+			results[key] = r
+			continue
+		}
+		if job := s.pending[key]; job != nil {
+			waiting[key] = job
+			continue
+		}
+		var job *imageJob
+		if s.finishesInTimeLocked(len(b64), time.Until(deadline)) {
+			job = s.enqueueLocked(key, b64)
+		}
+		if job == nil {
+			// Waiting would not get it in time: back-pressure sends it
+			// as it came, now and from now on.
+			s.stats.shed.Add(1)
+			s.settlePNGLocked(key, len(b64))
+			results[key] = imageResult{size: len(b64)}
+			continue
+		}
+		waiting[key] = job
+	}
+	s.mu.Unlock()
+
+	if len(waiting) > 0 {
+		s.awaitJobs(ctx, waiting, deadline)
+		waited := int64(time.Since(start))
+		s.stats.waits.Add(1)
+		s.stats.waitNanos.Add(waited)
+		for {
+			prev := s.stats.waitMaxNanos.Load()
+			if waited <= prev || s.stats.waitMaxNanos.CompareAndSwap(prev, waited) {
+				break
+			}
+		}
+		s.mu.Lock()
+		for key, job := range waiting {
+			if r, ok := s.cache.get(key); ok {
+				results[key] = r
+				continue
+			}
+			if ctx.Err() != nil {
+				// The client left: decide nothing on its account.
+				continue
+			}
+			if !job.cancelled {
+				// Late: call it off and send the PNG, now and from now on.
+				s.cancelLocked(job)
+				s.stats.late.Add(1)
+				s.settlePNGLocked(key, len(job.b64))
+			}
+		}
+		s.mu.Unlock()
+	}
+	return s.splice(body, imgs, keys, results)
+}
+
+// awaitJobs waits until every job is done, the deadline passes or ctx ends.
+func (s *imageStage) awaitJobs(ctx context.Context, jobs map[[32]byte]*imageJob, deadline time.Time) {
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	for _, job := range jobs {
+		select {
+		case <-job.done:
+		case <-timer.C:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// cancelLocked takes job out of the queue, or, if a worker already has it,
+// makes the worker drop its result.
+func (s *imageStage) cancelLocked(job *imageJob) {
+	job.cancelled = true
+	if !job.started {
+		s.queued -= len(job.b64)
+	}
+	delete(s.pending, job.key)
+	close(job.done)
+}
+
+// splice builds the body to send: each image with a WebP result becomes a
+// WebP data URL, the rest stays as it was.
+func (s *imageStage) splice(body []byte, imgs []dataImage, keys [][32]byte, results map[[32]byte]imageResult) []byte {
+	const mimeTail = len("png;base64,")
+	var out []byte
+	last := 0
+	for i, img := range imgs {
+		r := results[keys[i]]
+		if r.webp == nil {
+			continue
+		}
+		if out == nil {
+			out = make([]byte, 0, len(body))
+		}
+		out = append(out, body[last:img.start-mimeTail]...)
+		out = append(out, "webp;base64,"...)
+		out = append(out, r.webp...)
+		last = img.end
+		s.stats.replaced.Add(1)
+		s.stats.replacedBytes.Add(int64(img.end - img.start))
+		s.stats.replacedWebp.Add(int64(len(r.webp)))
+	}
+	for i, img := range imgs {
+		if r, ok := results[keys[i]]; ok {
+			s.countKnown(body[img.start:img.end], r)
+		}
+	}
+	if out == nil {
+		return body
+	}
+	return append(out, body[last:]...)
 }
 
 // work runs on a thread of its own at a lower CPU priority, so that the
 // request path, Caddy and frps on the same cores come first.
-func (s *imageShadow) work() {
+func (s *imageStage) work() {
 	runtime.LockOSThread()
 	lowerThreadPriority()
 	for job := range s.jobs {
 		s.mu.Lock()
+		if job.cancelled {
+			s.mu.Unlock()
+			continue
+		}
+		job.started = true
 		s.queued -= len(job.b64)
 		s.mu.Unlock()
-		size := s.measure(job.b64)
+		began := time.Now()
+		r := s.measure(job.b64)
+		took := time.Since(began)
 		s.mu.Lock()
-		delete(s.pending, job.key)
-		s.sizes.put(job.key, size)
+		if took > 0 {
+			const weight = 0.2
+			s.rate = (1-weight)*s.rate + weight*float64(len(job.b64))/took.Seconds()
+		}
+		if !job.cancelled {
+			s.cache.put(job.key, r)
+			delete(s.pending, job.key)
+			close(job.done)
+		}
 		s.mu.Unlock()
 	}
 }
 
-// measure transcodes one payload and returns the base64 bytes the request
-// would carry: the WebP's, or the original's when that is not worth it.
-func (s *imageShadow) measure(b64 []byte) int {
+// measure transcodes one payload and returns what a request carries for it:
+// the WebP, or the original when that is not worth it.
+func (s *imageStage) measure(b64 []byte) imageResult {
 	start := time.Now()
 	out, err := s.transcode(b64)
 	s.stats.nanos.Add(int64(time.Since(start)))
-	size := len(b64)
+	r := imageResult{size: len(b64)}
 	switch {
 	case err != nil:
 		s.stats.failed.Add(1)
 	case float64(len(out)) > imageKeepRatio*float64(len(b64)):
 		s.stats.kept.Add(1)
 	default:
-		size = len(out)
+		r.size = len(out)
+		if s.mode == imagesWebp {
+			r.webp = out
+		}
 	}
 	s.stats.distinct.Add(1)
 	s.stats.distinctBytes.Add(int64(len(b64)))
-	s.stats.distinctWebp.Add(int64(size))
-	return size
+	s.stats.distinctWebp.Add(int64(r.size))
+	return r
 }
 
-func (s *imageShadow) snapshot() map[string]any {
+func (s *imageStage) snapshot() map[string]any {
 	st := &s.stats
 	ratio := func(a, b int64) float64 {
 		if b == 0 {
@@ -226,12 +474,17 @@ func (s *imageShadow) snapshot() map[string]any {
 		}
 		return float64(a) / float64(b)
 	}
-	avgMs := 0.0
-	if n := st.distinct.Load(); n > 0 {
-		avgMs = float64(st.nanos.Load()) / float64(n) / 1e6
+	perMs := func(nanos, n int64) float64 {
+		if n == 0 {
+			return 0
+		}
+		return float64(nanos) / float64(n) / 1e6
 	}
-	return map[string]any{
-		"mode": imagesShadow, "quality": s.quality,
+	s.mu.Lock()
+	cached, cacheBytes, rate := s.cache.len(), s.cache.used, s.rate
+	s.mu.Unlock()
+	snap := map[string]any{
+		"mode": s.mode, "quality": s.quality, "workers": s.workers,
 		"bodies": st.bodies.Load(), "body_bytes": st.bodyBytes.Load(),
 		"seen": st.seen.Load(), "seen_bytes": st.seenBytes.Load(),
 		"known": st.known.Load(), "known_bytes": st.knownBytes.Load(), "known_webp_bytes": st.knownWebp.Load(),
@@ -243,18 +496,37 @@ func (s *imageShadow) snapshot() map[string]any {
 		"distinct_ratio": ratio(st.distinctBytes.Load(), st.distinctWebp.Load()),
 		"kept":           st.kept.Load(), "failed": st.failed.Load(), "busy": st.busy.Load(),
 		"small": st.small.Load(), "other_format": st.otherFormat.Load(), "other_format_bytes": st.otherBytes.Load(),
-		"transcode_ms_avg": avgMs, "queued": len(s.jobs), "workers": s.workers,
+		"transcode_ms_avg": perMs(st.nanos.Load(), st.distinct.Load()), "queued": len(s.jobs),
+		"rate_kib_s": rate / 1024, "cached": cached, "cache_bytes": cacheBytes,
 	}
+	if s.mode == imagesWebp {
+		snap["wait_ms"] = s.wait.Milliseconds()
+		snap["replaced"] = st.replaced.Load()
+		snap["replaced_bytes"] = st.replacedBytes.Load()
+		snap["replaced_webp_bytes"] = st.replacedWebp.Load()
+		snap["late"] = st.late.Load()
+		snap["shed"] = st.shed.Load()
+		snap["waits"] = st.waits.Load()
+		snap["wait_ms_avg"] = perMs(st.waitNanos.Load(), st.waits.Load())
+		snap["wait_ms_max"] = float64(st.waitMaxNanos.Load()) / 1e6
+	}
+	return snap
 }
 
 // parseImages builds the image stage for -images, or nil when it is off.
-func parseImages(mode string, quality, workers int) (*imageShadow, error) {
+func parseImages(mode string, quality, workers int, wait time.Duration) (*imageStage, error) {
+	cache := imageCacheMiB << 20
 	switch mode {
 	case imagesOff, "":
 		return nil, nil
 	case imagesShadow:
+		cache = 1 << 16 * imageEntryBytes
+	case imagesWebp:
+		if wait <= 0 || wait > time.Minute {
+			return nil, fmt.Errorf("bad -images-wait %v: want (0, 1m]", wait)
+		}
 	default:
-		return nil, fmt.Errorf("bad -images %q: want off or shadow", mode)
+		return nil, fmt.Errorf("bad -images %q: want off, shadow or webp", mode)
 	}
 	if quality < 1 || quality > 100 {
 		return nil, fmt.Errorf("bad -images-quality %d: want 1..100", quality)
@@ -266,44 +538,57 @@ func parseImages(mode string, quality, workers int) (*imageShadow, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newImageShadow(quality, workers, imageQueueMiB<<20, 1<<16, transcode), nil
+	return newImageStage(imageConfig{
+		mode: mode, quality: quality, workers: workers, wait: wait,
+		queueBytes: imageQueueMiB << 20, cacheBytes: cache,
+	}, transcode), nil
 }
 
-// sizeLRU remembers a size per key, dropping the least recently used past cap.
-type sizeLRU struct {
-	cap   int
-	order *list.List
-	items map[[32]byte]*list.Element
+// imageLRU keeps results up to a byte budget, dropping the least recently
+// used first.
+type imageLRU struct {
+	limit, used int
+	order       *list.List
+	items       map[[32]byte]*list.Element
 }
 
-type sizeEntry struct {
-	key  [32]byte
-	size int
+type imageEntry struct {
+	key [32]byte
+	r   imageResult
 }
 
-func newSizeLRU(cap int) *sizeLRU {
-	return &sizeLRU{cap: cap, order: list.New(), items: make(map[[32]byte]*list.Element)}
+func newImageLRU(limit int) *imageLRU {
+	return &imageLRU{limit: limit, order: list.New(), items: make(map[[32]byte]*list.Element)}
 }
 
-func (l *sizeLRU) get(key [32]byte) (int, bool) {
+func entryCost(r imageResult) int { return imageEntryBytes + len(r.webp) }
+
+func (l *imageLRU) len() int { return l.order.Len() }
+
+func (l *imageLRU) get(key [32]byte) (imageResult, bool) {
 	el, ok := l.items[key]
 	if !ok {
-		return 0, false
+		return imageResult{}, false
 	}
 	l.order.MoveToFront(el)
-	return el.Value.(*sizeEntry).size, true
+	return el.Value.(*imageEntry).r, true
 }
 
-func (l *sizeLRU) put(key [32]byte, size int) {
+func (l *imageLRU) put(key [32]byte, r imageResult) {
 	if el, ok := l.items[key]; ok {
-		el.Value.(*sizeEntry).size = size
+		e := el.Value.(*imageEntry)
+		l.used += entryCost(r) - entryCost(e.r)
+		e.r = r
 		l.order.MoveToFront(el)
-		return
+	} else {
+		l.items[key] = l.order.PushFront(&imageEntry{key: key, r: r})
+		l.used += entryCost(r)
 	}
-	l.items[key] = l.order.PushFront(&sizeEntry{key: key, size: size})
-	for l.order.Len() > l.cap {
+	for l.used > l.limit && l.order.Len() > 1 {
 		last := l.order.Back()
+		e := last.Value.(*imageEntry)
 		l.order.Remove(last)
-		delete(l.items, last.Value.(*sizeEntry).key)
+		delete(l.items, e.key)
+		l.used -= entryCost(e.r)
 	}
 }
