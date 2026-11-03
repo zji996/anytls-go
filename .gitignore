@@ -2,12 +2,15 @@
 /cmd/client/client
 /cmd/server/server
 /cmd/dedup/dedup
+/cmd/blobcache/blobcache
 
 # Local build outputs
 /anytls-client
 /anytls-server
 /client
 /server
+/dedup
+/blobcache
 *.test
 *.exe
 *.zip
@@ -31,6 +34,10 @@ trace.out
 /speedtest
 /speedtest.*
 *.part
+
+# Local rollout scratch (runbooks, state, credential backups) and agent run state
+/tmp/
+/.local/
 
 # Local logs and editor state
 *.log
