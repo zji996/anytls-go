@@ -287,6 +287,23 @@ func TestWebpSwapsReadyImagesAndLeavesTheRest(t *testing.T) {
 	}
 }
 
+// An image the client already sent as WebP (or JPEG) is lossy already: it is
+// never transcoded a second time, only the PNGs are.
+func TestWebpLeavesClientWebpAlone(t *testing.T) {
+	var calls atomic.Int64
+	s := webpStage(2, time.Second, halfTranscoder(&calls))
+	png := image(100 << 10)
+	theirs := strings.Replace(image(120<<10), "image/png", "image/webp", 1)
+	body := conversation(2, []string{theirs, png, theirs})
+	got := s.process(context.Background(), body)
+	if want := conversation(2, []string{theirs, asWebp(png), theirs}); string(got) != string(want) {
+		t.Fatal("the client's WebP changed, or the PNG was not swapped")
+	}
+	if snap := s.snapshot(); calls.Load() != 1 || snap["other_format"] == int64(0) || snap["replaced"] != int64(1) {
+		t.Fatalf("%d transcodes, want 1 (the PNG only): %v", calls.Load(), snap)
+	}
+}
+
 func TestWebpLateImageGoesAsPNGAndStaysPNG(t *testing.T) {
 	var calls atomic.Int64
 	release := make(chan struct{})
