@@ -37,7 +37,7 @@ Sub2API (8.12)  --http-->  前端 -reverse (8.1:10863)  --通道 main 编码--> 
 请求形态：`http://<reverse>/<origin>/<path>?<query>` 转为 `https://<origin>/<path>?<query>`，`Host` 改为 `<origin>`，只支持 443。处理顺序：
 
 1. 源地址不在 `-reverse-allow` 内：关闭连接。
-2. 第一段路径不在 `-reverse-origins` 内：`421 Misdirected Request`。
+2. 第一段路径不在 `-reverse-origins` 内（精确匹配主机名，不含其下的子域）：`421 Misdirected Request`。
 3. 通道健康且解码端声明接受该主机：交给通道编码器，与拦截请求同一路径（`enc.ServeHTTP`）。
 4. 否则交给通道的直连代理（`lane.direct`，经同一 anytls 出口直达上游，不去重）。因此：
    - 解码端暂时不可达时，请求照样完成，只是不去重；
@@ -48,7 +48,7 @@ Sub2API (8.12)  --http-->  前端 -reverse (8.1:10863)  --通道 main 编码--> 
 ### 解码端：可热更新的域名名单（`cmd/dedup back`）
 
 - 新增 `-domains-file FILE`，格式同上，SIGHUP 重读，解析失败保留旧名单；与 `-domains` 二选一。
-- `/health` 增加响应头 `X-Dedup-Domains`，列出当前名单。编码端每次探测（5 s）记下它；前端第 3 步据此判断。拿不到这个头（旧解码端）时，只把前端 `-domains`（拦截名单）里的主机视为解码端接受，行为与现在一致。
+- `/health` 增加响应头 `X-Edge-Dedup-Domains`，列出当前名单。编码端每次探测（5 s）记下它；前端第 3 步据此判断。拿不到这个头（旧解码端）时，只把前端 `-domains`（拦截名单）里的主机视为解码端接受，行为与现在一致。
 - `scripts/install-dedup.sh`：名单落到 `/etc/anytls/dedup-domains`（首次从现有 `ANYTLS_DEDUP_DOMAINS` 迁移），unit 改用 `-domains-file` 并加 `ExecReload=/bin/kill -HUP $MAINPID`。原有的事务和回滚照旧。迁移后名单文件是真源：`dedup.env` 里的 `ANYTLS_DEDUP_DOMAINS` 每次安装按文件重写，改名单只改 `dedup-domains`。
 - `back` 必须给 `-domains` 或 `-domains-file` 之一；两者都不给不再表示“任意主机”，而是启动失败。
 - 安装器 `update`/`install`：主服务的程序、环境、密码、padding 与 unit 都与现网逐字节相同时，不重启 anytls-server（回滚时同理）。构建是可复现的（`-trimpath -buildvcs=false`），只改解码端的提交因此只重启解码端。
@@ -86,7 +86,7 @@ Sub2API (8.12)  --http-->  前端 -reverse (8.1:10863)  --通道 main 编码--> 
 中断面：
 
 - 第 1 步：解码端停止到新进程就绪之间（秒级），前端各通道改走直连，请求不失败；经解码端的在途请求有 30 s 排空，超过 30 s 的流式回复会被截断；缓存清空，每个会话的下一个请求整包过一次。
-- 第 2 步：旧前端排空 30 s，超过的长流式回复被截断。
+- 第 2 步：旧前端排空 30 s，超过的长流式回复被截断。新前端此后同样排空（含反向入口上的请求）。
 - 第 3 步：无。
 
 建议在低峰执行；两步可以在同一窗口里连做，缓存只冷启动一次。

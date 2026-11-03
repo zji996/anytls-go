@@ -58,6 +58,18 @@ func (s *domainSet) match(name string) bool {
 	return s.get().match(name)
 }
 
+// has reports whether name is on the list itself, not only under a listed
+// domain: the reverse entry forwards to exactly the hosts it names.
+func (s *domainSet) has(name string) bool {
+	name = strings.TrimSuffix(strings.ToLower(name), ".")
+	for _, d := range s.get() {
+		if name == d {
+			return true
+		}
+	}
+	return false
+}
+
 // String is the list as /health advertises it.
 func (s *domainSet) String() string {
 	return strings.Join(s.get(), ",")

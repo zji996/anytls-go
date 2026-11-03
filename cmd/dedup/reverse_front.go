@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // The reverse entry lets an upstream join dedup without intercepting its TLS:
@@ -58,6 +59,21 @@ func newReverseFront(f *front, c reverseConfig) (*reverseFront, error) {
 		return nil, fmt.Errorf("-reverse-allow is required with -reverse: %w", err)
 	}
 	return r, nil
+}
+
+// start serves the entry on ln. done yields nil once Shutdown has ended it,
+// or the error that ended it otherwise.
+func (r *reverseFront) start(ln net.Listener) (*http.Server, <-chan error) {
+	srv := &http.Server{Handler: r, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute}
+	done := make(chan error, 1)
+	go func() {
+		err := srv.Serve(ln)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		done <- err
+	}()
+	return srv, done
 }
 
 // reload rereads the origins and the auth file on SIGHUP. A file that does not
@@ -176,7 +192,7 @@ func (r *reverseFront) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		http.Error(w, "want /<origin>/<path>", http.StatusBadRequest)
 		return
 	}
-	if !r.origins.match(origin) {
+	if !r.origins.has(origin) {
 		f.reverseRefused.Add(1)
 		log.Printf("reverse: %s is not an allowed origin", origin)
 		http.Error(w, "origin not allowed", http.StatusMisdirectedRequest)

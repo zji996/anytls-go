@@ -157,42 +157,49 @@ func runFront(args []string) {
 			log.Fatal(err)
 		}
 	}()
-	var rln net.Listener
 	var rserver *http.Server
 	if *reverse != "" {
-		r, err := newReverseFront(f, reverseConfig{origins: *reverseOrigins, auth: *reverseAuth, allow: *reverseAllow})
+		cfg := reverseConfig{origins: *reverseOrigins, auth: *reverseAuth, allow: *reverseAllow}
+		r, err := newReverseFront(f, cfg)
 		if err != nil {
 			log.Fatal(err)
 		}
-		rln, err = bind(*reverse)
+		// Before the entry listens: a SIGHUP nobody has registered ends the
+		// program.
+		onHangup(func() error { return r.reload(cfg) })
+		rln, err := bind(*reverse)
 		if err != nil {
 			log.Fatal(err)
 		}
-		rserver = &http.Server{Handler: r, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute}
 		log.Printf("dedup front reverse entry on %s for %s", *reverse, r.origins)
+		var done <-chan error
+		rserver, done = r.start(rln)
 		go func() {
-			if err := rserver.Serve(rln); !errors.Is(err, http.ErrServerClosed) {
+			if err := <-done; err != nil {
 				log.Fatal(err)
 			}
 		}()
-		cfg := reverseConfig{origins: *reverseOrigins, auth: *reverseAuth, allow: *reverseAllow}
-		onHangup(func() error { return r.reload(cfg) })
 	}
 	untilSignal(*drain, func(ctx context.Context) {
 		time.Sleep(*linger)
-		ln.Close()
-		var drained sync.WaitGroup
-		if rln != nil {
-			// No new reverse connections, while the open ones drain like
-			// the intercepted and relayed ones.
-			rln.Close()
-			drained.Add(1)
-			go func() { defer drained.Done(); rserver.Shutdown(ctx) }()
-		}
-		drained.Add(1)
-		go func() { defer drained.Done(); f.shutdown(ctx) }()
-		drained.Wait()
+		stopFront(ctx, ln, rserver, f)
 	})
+}
+
+// stopFront stops accepting and drains, the intercepted, relayed and reverse
+// requests at once, until they are done or ctx ends.
+func stopFront(ctx context.Context, ln net.Listener, rserver *http.Server, f *front) {
+	ln.Close()
+	var drained sync.WaitGroup
+	if rserver != nil {
+		// Shutdown closes the entry's listener itself. Closing it first
+		// would end Serve with an error before Shutdown is under way.
+		drained.Add(1)
+		go func() { defer drained.Done(); rserver.Shutdown(ctx) }()
+	}
+	drained.Add(1)
+	go func() { defer drained.Done(); f.shutdown(ctx) }()
+	drained.Wait()
 }
 
 // maxLanes bounds the exits one front keeps an encoder and index for.

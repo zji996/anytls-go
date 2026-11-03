@@ -92,6 +92,9 @@ type reverseEntryChain struct {
 	reverse *reverseFront
 	lanes   *laneSet
 	cfg     reverseConfig
+	// reverseServer serves the entry; reverseDone is what start returned.
+	reverseServer *http.Server
+	reverseDone   <-chan error
 	// reverseURL is the plain HTTP entry; direct is a client that reaches it.
 	reverseURL *url.URL
 	client     *http.Client
@@ -165,9 +168,9 @@ func newReverseEntryChain(t *testing.T, advertise domainList) *reverseEntryChain
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ln.Close(); c.front.conns.Close() })
-	server := &http.Server{Handler: c.reverse}
-	go server.Serve(ln)
-	t.Cleanup(func() { server.Close() })
+	// The entry as runFront serves it.
+	c.reverseServer, c.reverseDone = c.reverse.start(ln)
+	t.Cleanup(func() { c.reverseServer.Close() })
 	c.reverseURL = mustURL(t, "http://"+ln.Addr().String())
 	c.client = &http.Client{}
 	return c
@@ -538,5 +541,63 @@ func TestFrontReverseRequiresAnAllowlist(t *testing.T) {
 	cfg.allow = ""
 	if _, err := newReverseFront(c.front, cfg); err == nil {
 		t.Fatal("a reverse entry without -reverse-allow was built")
+	}
+}
+
+// Stopping the front lets a reply in flight through the reverse entry finish,
+// and ends the entry cleanly rather than as an error, which would exit the
+// program and cut every open request.
+func TestFrontReverseDrainsOnStop(t *testing.T) {
+	c := newReverseEntryChain(t, domainList{reverseTestHost})
+	body := conversation(1, []string{image(100 << 10)})
+	resp, err := c.client.Post(c.reverseURL.String()+"/"+reverseTestHost+"/stream", "application/json", strings.NewReader(string(body)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 64)
+	if n, _ := resp.Body.Read(buf); !strings.Contains(string(buf[:n]), "data: first") {
+		t.Fatalf("first bytes %q", buf[:n])
+	}
+	main, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped := make(chan struct{})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		stopFront(ctx, main, c.reverseServer, c.front)
+		close(stopped)
+	}()
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil || !strings.Contains(string(rest), "data: second") {
+		t.Fatalf("the reply in flight was cut: %q, %v", rest, err)
+	}
+	select {
+	case err := <-c.reverseDone:
+		if err != nil {
+			t.Fatalf("the entry ended with %v, which runFront treats as fatal", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the entry did not end after the drain")
+	}
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stopFront did not return")
+	}
+}
+
+// The entry forwards to exactly the hosts it lists, not to every name under
+// them.
+func TestFrontReverseMatchesOriginsExactly(t *testing.T) {
+	c := newReverseEntryChain(t, domainList{reverseTestHost})
+	body := conversation(1, []string{image(10 << 10)})
+	if status := c.post(t, "other."+reverseTestHost, "/v1/chat/completions", body); status != http.StatusMisdirectedRequest {
+		t.Fatalf("an unlisted name under a listed one answered %d, want 421", status)
+	}
+	if status := c.post(t, "SUB."+reverseTestHost, "/v1/models", nil); status == http.StatusMisdirectedRequest {
+		t.Fatal("a listed host in other case was refused")
 	}
 }
