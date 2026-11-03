@@ -25,8 +25,11 @@ import (
 // remembers it. An upstream prompt cache matches a conversation's resent
 // images byte for byte, so an image must not change form between turns.
 //
-// The codec lives behind the dedupimages build tag (see images_webp.go), so
-// builds without it, such as the router front, link no image code at all.
+// The codec lives behind the dedupimages build tag (see images_webp.go and
+// images_webp_native.go), so builds without it, such as the router front, link
+// no image code at all. Of the two codecs, nodynamic picks libwebp transpiled
+// to Go and webpnative picks libwebp compiled in through cgo; they encode to
+// the same bytes.
 
 const (
 	imagesOff    = "off"
