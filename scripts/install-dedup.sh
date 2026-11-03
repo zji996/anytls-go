@@ -7,6 +7,9 @@ dedup_user="${ANYTLS_DEDUP_USER:-anytls-dedup}"
 dedup_bin="${ANYTLS_DEDUP_BIN_PATH:-/usr/local/bin/anytls-dedup}"
 dedup_unit="${ANYTLS_DEDUP_SYSTEMD_UNIT:-$(dirname "$systemd_unit")/$dedup_service_name.service}"
 dedup_config="$config_dir/dedup.env"
+# One allowed origin per line; -domains-file rereads it on SIGHUP, so adding
+# an upstream restarts no process.
+dedup_domains_file="$config_dir/dedup-domains"
 dedup_runtime_name="${ANYTLS_DEDUP_RUNTIME_NAME:-$dedup_service_name}"
 dedup_runtime="${ANYTLS_DEDUP_RUNTIME_DIR:-/run/$dedup_runtime_name}"
 dedup_backend="unix:$dedup_runtime/back.sock"
@@ -72,6 +75,25 @@ dedup_load_defaults() {
       esac
     fi
   done
+  # The list file is the allowlist once it exists; the DOMAINS setting is
+  # what it is migrated from, and stays for tooling that still reads it.
+  if [[ -f "$dedup_domains_file" ]]; then
+    dedup_read_domains_file || return 1
+  fi
+}
+
+# dedup_read_domains_file folds the list file into dedup_domains, so that
+# validation, status and dedup.env describe the list actually in use.
+dedup_read_domains_file() {
+  local entry list=""
+  while IFS= read -r entry || [[ -n "$entry" ]]; do
+    entry="${entry%%#*}"
+    entry="$(printf '%s' "$entry" | tr -d '[:space:]')"
+    [[ -n "$entry" ]] || continue
+    list+="${list:+,}$entry"
+  done <"$dedup_domains_file" || return 1
+  [[ -n "$list" ]] || { echo "dedup domains file is empty: $dedup_domains_file" >&2; return 1; }
+  dedup_domains="$list"
 }
 
 dedup_validate() {
@@ -90,6 +112,11 @@ dedup_validate() {
     echo 'dedup memory limits must cover cache overhead, inflight budget and runtime headroom' >&2
     return 1
   }
+  [[ "$dedup_domains_file" =~ ^/[a-zA-Z0-9_./-]+$ && "$dedup_domains_file" != *'/../'* && "$dedup_domains_file" != */.. ]] || return 1
+  if [[ "$dedup_enabled" == 1 && ( -L "$dedup_domains_file" || ( -e "$dedup_domains_file" && ! -f "$dedup_domains_file" ) ) ]]; then
+    echo 'unsafe dedup domains file path' >&2
+    return 1
+  fi
   [[ "$dedup_domains" =~ ^[a-zA-Z0-9][a-zA-Z0-9.,-]*$ ]] || { echo 'dedup domain allowlist must be nonempty' >&2; return 1; }
   python3 - "$dedup_domains" <<'PY'
 import re, sys
@@ -189,12 +216,13 @@ Type=simple
 User=$dedup_user
 Group=$service_group
 EnvironmentFile=$dedup_config
-ExecStart=$dedup_bin back -listen $dedup_backend -admin unix:$dedup_runtime/admin.sock -domains \$ANYTLS_DEDUP_DOMAINS -cache-mib \$ANYTLS_DEDUP_CACHE_MIB -inflight-mib \$ANYTLS_DEDUP_INFLIGHT_MIB -max-body-mib \$ANYTLS_DEDUP_MAX_BODY_MIB -memory-mib \$ANYTLS_DEDUP_MEMORY_MIB -drain 30s
+ExecStart=$dedup_bin back -listen $dedup_backend -admin unix:$dedup_runtime/admin.sock -domains-file $dedup_domains_file -cache-mib \$ANYTLS_DEDUP_CACHE_MIB -inflight-mib \$ANYTLS_DEDUP_INFLIGHT_MIB -max-body-mib \$ANYTLS_DEDUP_MAX_BODY_MIB -memory-mib \$ANYTLS_DEDUP_MEMORY_MIB -drain 30s
 RuntimeDirectory=$dedup_runtime_name
 RuntimeDirectoryMode=0750
 UMask=0007
 Restart=on-failure
 RestartSec=1
+ExecReload=/bin/kill -HUP \$MAINPID
 TimeoutStopSec=40
 MemoryMax=${dedup_memory_max}M
 MemorySwapMax=0
@@ -218,7 +246,16 @@ SystemCallArchitectures=native
 WantedBy=multi-user.target
 EOF
   then return 1; fi
-  chmod 0640 "$stage_dir/dedup.env" || return 1
+  if [[ -f "$dedup_domains_file" ]]; then
+    cp "$dedup_domains_file" "$stage_dir/dedup-domains" || return 1
+  else
+    local domain
+    : >"$stage_dir/dedup-domains" || return 1
+    for domain in ${dedup_domains//,/ }; do
+      printf '%s\n' "$domain" >>"$stage_dir/dedup-domains" || return 1
+    done
+  fi
+  chmod 0640 "$stage_dir/dedup.env" "$stage_dir/dedup-domains" || return 1
   chmod 0644 "$stage_dir/$dedup_service_name.service" || return 1
 }
 
@@ -229,6 +266,7 @@ dedup_backup() {
   systemctl is-enabled "$dedup_service_name" >/dev/null 2>&1 && dedup_was_enabled=1
   backup_path "$dedup_bin" dedup_binary &&
     backup_path "$dedup_config" dedup_environment &&
+    backup_path "$dedup_domains_file" dedup_domains_list &&
     backup_path "$dedup_unit" dedup_unit &&
     backup_path "$config_dir/dedup-user.managed" dedup_user_managed
 }
@@ -292,6 +330,7 @@ dedup_apply() {
   [[ "$dedup_enabled" == 1 ]] || return 0
   atomic_install "$stage_dir/anytls-dedup" "$dedup_bin" root root 0755 &&
     atomic_install "$stage_dir/dedup.env" "$dedup_config" root "$service_group" 0640 &&
+    atomic_install "$stage_dir/dedup-domains" "$dedup_domains_file" root "$service_group" 0640 &&
     atomic_install "$stage_dir/$dedup_service_name.service" "$dedup_unit" root root 0644 || return 1
   if [[ "$dedup_user_created" == 1 ]]; then
     install -m 0600 /dev/null "$config_dir/dedup-user.managed" || return 1
@@ -328,6 +367,7 @@ dedup_restore_files() {
   fi
   restore_path "$dedup_bin" dedup_binary || failed=1
   restore_path "$dedup_config" dedup_environment || failed=1
+  restore_path "$dedup_domains_file" dedup_domains_list || failed=1
   restore_path "$dedup_unit" dedup_unit || failed=1
   restore_path "$config_dir/dedup-user.managed" dedup_user_managed || failed=1
   return "$failed"
@@ -359,7 +399,7 @@ dedup_finalize_restore_state() {
 dedup_status() {
   echo "Dedup enabled: $dedup_enabled"
   [[ "$dedup_enabled" == 1 ]] || return 0
-  echo "Dedup domains: $dedup_domains; cache=$dedup_cache MiB; soft=$dedup_memory MiB; hard=$dedup_memory_max MiB"
+  echo "Dedup domains: $dedup_domains ($dedup_domains_file); cache=$dedup_cache MiB; soft=$dedup_memory MiB; hard=$dedup_memory_max MiB"
   systemctl --no-pager --full status "$dedup_service_name" || true
   if ! dedup_local_request "$dedup_runtime/admin.sock" /stats; then
     echo 'Dedup statistics unavailable; client-side savings have not been verified.'
@@ -378,7 +418,7 @@ dedup_doctor() {
     fi
     return
   fi
-  if [[ "$(read_env_value ANYTLS_DEDUP_BACKEND)" != "$dedup_backend" || ! -x "$dedup_bin" || ! -f "$dedup_config" || ! -f "$dedup_unit" ]]; then
+  if [[ "$(read_env_value ANYTLS_DEDUP_BACKEND)" != "$dedup_backend" || ! -x "$dedup_bin" || ! -f "$dedup_config" || ! -f "$dedup_domains_file" || ! -f "$dedup_unit" ]]; then
     doctor_fail 'decoder program, files or main-service backend configuration missing'
     return
   fi

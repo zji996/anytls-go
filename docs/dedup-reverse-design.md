@@ -1,6 +1,6 @@
 # 去重反向入口：不拦截 TLS 的上游接入
 
-状态：设计稿，待实现。部署由操作者执行；执行前须经独立审查（deepseek）通过。
+状态：anytls-go 侧已实现（前端反向入口、解码端名单文件、安装器只重启有变化的服务）；Stargate 侧实现中。部署由操作者执行；执行前须经独立审查（deepseek）通过。
 
 ## 背景
 
@@ -31,7 +31,7 @@ Sub2API (8.12)  --http-->  前端 -reverse (8.1:10863)  --通道 main 编码--> 
 
 - `-reverse ADDR`：明文 HTTP 监听，例如 `192.168.8.1:10863`。
 - `-reverse-origins FILE`：允许经反向入口访问的上游主机，一行一个，`#` 起注释；SIGHUP 重读，文件解析失败时保留旧名单并记录日志。
-- `-reverse-allow CIDRS`：允许的客户端源地址（逗号分隔），不在其内的连接直接关闭。Stargate 用 `devices` 填。
+- `-reverse-allow CIDRS`：允许的客户端源地址（逗号分隔），开启 `-reverse` 时必填；不在其内的请求得到 403。Stargate 用 `devices` 填。
 - `-reverse-auth FILE`：内容为 `user:password`，即 sing-box `dedup-in` 入站的用户。反向请求用它取通道：通道按 SOCKS 用户名和密码作键，与 sing-box 送来的拦截流量取到**同一个通道**，共用编码器、索引、解码端链路。SIGHUP 同样重读。
 
 请求形态：`http://<reverse>/<origin>/<path>?<query>` 转为 `https://<origin>/<path>?<query>`，`Host` 改为 `<origin>`，只支持 443。处理顺序：
@@ -49,7 +49,10 @@ Sub2API (8.12)  --http-->  前端 -reverse (8.1:10863)  --通道 main 编码--> 
 
 - 新增 `-domains-file FILE`，格式同上，SIGHUP 重读，解析失败保留旧名单；与 `-domains` 二选一。
 - `/health` 增加响应头 `X-Dedup-Domains`，列出当前名单。编码端每次探测（5 s）记下它；前端第 3 步据此判断。拿不到这个头（旧解码端）时，只把前端 `-domains`（拦截名单）里的主机视为解码端接受，行为与现在一致。
-- `scripts/install-dedup.sh`：名单落到 `/etc/anytls/dedup-domains`（首次从现有 `ANYTLS_DEDUP_DOMAINS` 迁移），unit 改用 `-domains-file` 并加 `ExecReload=/bin/kill -HUP $MAINPID`。原有的事务和回滚照旧。
+- `scripts/install-dedup.sh`：名单落到 `/etc/anytls/dedup-domains`（首次从现有 `ANYTLS_DEDUP_DOMAINS` 迁移），unit 改用 `-domains-file` 并加 `ExecReload=/bin/kill -HUP $MAINPID`。原有的事务和回滚照旧。迁移后名单文件是真源：`dedup.env` 里的 `ANYTLS_DEDUP_DOMAINS` 每次安装按文件重写，改名单只改 `dedup-domains`。
+- `back` 必须给 `-domains` 或 `-domains-file` 之一；两者都不给不再表示“任意主机”，而是启动失败。
+- 安装器 `update`/`install`：主服务的程序、环境、密码、padding 与 unit 都与现网逐字节相同时，不重启 anytls-server（回滚时同理）。构建是可复现的（`-trimpath -buildvcs=false`），只改解码端的提交因此只重启解码端。
+- SIGHUP 在函数返回前就已注册：Go 程序收到未注册的 SIGHUP 会退出，刚启动就收到 reload 也不能把它打死。现有 `decode` 模式的路由热加载原先在协程里注册，有同样的窗口，一并修正。
 
 ### Stargate（8.1）
 
@@ -76,7 +79,7 @@ Sub2API (8.12)  --http-->  前端 -reverse (8.1:10863)  --通道 main 编码--> 
 
 顺序：
 
-1. DMIT：用新版 `install-dedup.sh` 换解码端程序、写名单文件、改 unit，重启一次 `anytls-dedup`。anytls-server 不重启。
+1. DMIT：先在机上用目标提交构建 `cmd/server`，与现网 `/usr/local/bin/anytls-server` 做 `cmp`，确认相同；再执行安装器 `update`：解码端换程序、写名单文件、改 unit，重启一次 `anytls-dedup`，anytls-server 因无变化不重启。
 2. 8.1：`dedup.sh` 配置 `reverse_listen`、`reverse_origins`，用 `upgrade.sh --router` 交接前端（新旧实例并存，旧实例 `-linger` 后排空）。sing-box 不重启。
 3. 8.12：先用 curl 经 `http://192.168.8.1:10863/api.09050207.xyz/v1/models` 验证（期望 401，与直连一致），再在 Sub2API 后台改账号 107 的 base_url，观察 `usage_logs` 与前端 `/stats`。
 

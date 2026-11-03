@@ -295,6 +295,14 @@ grep -Fq '127.0.0.1:8443' "$MOCK_PROBE_LOG"
 
 "$installer" doctor >/dev/null
 
+# Nothing of the main service changed: it keeps running, so an update that
+# only touches the decoder drops no proxied connection.
+main_restarts="$(grep -c '^restart anytls-test$' "$MOCK_SYSTEMCTL_LOG" || true)"
+"$installer" "${install_args[@]}" --binary "$old_binary" >"$test_root/unchanged.log"
+grep -Fq 'anytls-test unchanged; not restarted' "$test_root/unchanged.log"
+[[ "$(grep -c '^restart anytls-test$' "$MOCK_SYSTEMCTL_LOG" || true)" == "$main_restarts" ]]
+cmp -s "$old_binary" "$ANYTLS_BIN_PATH"
+
 "$installer" install --non-interactive --no-firewall --binary "$new_binary" >/dev/null
 cmp -s "$new_binary" "$ANYTLS_BIN_PATH"
 [[ "$(<"$ANYTLS_PASSWORD_FILE")" == 'secret /@value' ]]
@@ -422,6 +430,11 @@ dedup_args=(install --non-interactive --no-firewall --password decoder-secret --
 [[ -f "$MOCK_SYSTEMCTL_ENABLED.dedup" ]]
 grep -q '^ANYTLS_DEDUP_ENABLED=1$' "$ANYTLS_ENV_FILE"
 grep -Fq 'MemoryMax=500M' "$ANYTLS_DEDUP_SYSTEMD_UNIT"
+grep -Fq -- "-domains-file $ANYTLS_CONFIG_DIR/dedup-domains" "$ANYTLS_DEDUP_SYSTEMD_UNIT"
+if grep -Eq -- '(^| )-domains [^-]' "$ANYTLS_DEDUP_SYSTEMD_UNIT"; then exit 1; fi
+grep -Fxq 'ExecReload=/bin/kill -HUP $MAINPID' "$ANYTLS_DEDUP_SYSTEMD_UNIT"
+cmp -s "$ANYTLS_CONFIG_DIR/dedup-domains" <(printf '%s\n' chatgpt.com api.openai.com)
+grep -Eq "^ANYTLS_DEDUP_DOMAINS='?chatgpt[.]com,api[.]openai[.]com'?$" "$ANYTLS_CONFIG_DIR/dedup.env"
 grep -Fq 'RestartSec=1' "$ANYTLS_DEDUP_SYSTEMD_UNIT"
 grep -Fq 'AF_UNIX' "$ANYTLS_SYSTEMD_UNIT"
 grep -Fq "Wants=$ANYTLS_DEDUP_SERVICE_NAME.service" "$ANYTLS_SYSTEMD_UNIT"
@@ -451,8 +464,18 @@ for enabled in 0 1; do
 done
 
 snapshot_decoder_install() {
-  sha256sum "$ANYTLS_BIN_PATH" "$ANYTLS_ENV_FILE" "$ANYTLS_PASSWORD_FILE" "$ANYTLS_SYSTEMD_UNIT" \
-    "$ANYTLS_PROBE_BIN_PATH" "$ANYTLS_DEDUP_BIN_PATH" "$ANYTLS_DEDUP_SYSTEMD_UNIT" "$ANYTLS_CONFIG_DIR/dedup.env"
+  # A file that is deliberately absent must not fail the snapshot, and its
+  # absence must still compare as a difference from a file that is there.
+  local path
+  for path in "$ANYTLS_BIN_PATH" "$ANYTLS_ENV_FILE" "$ANYTLS_PASSWORD_FILE" "$ANYTLS_SYSTEMD_UNIT" \
+    "$ANYTLS_PROBE_BIN_PATH" "$ANYTLS_DEDUP_BIN_PATH" "$ANYTLS_DEDUP_SYSTEMD_UNIT" "$ANYTLS_CONFIG_DIR/dedup.env" \
+    "$ANYTLS_CONFIG_DIR/dedup-domains"; do
+    if [[ -e "$path" ]]; then
+      sha256sum "$path"
+    else
+      printf '%s\n' "absent  $path"
+    fi
+  done
 }
 expect_decoder_failure() {
   snapshot_decoder_install >"$test_root/before.sha"
@@ -502,15 +525,68 @@ sed -i '/^ANYTLS_DEDUP_ENABLED=/d; /^ANYTLS_DEDUP_BACKEND=/d' "$ANYTLS_ENV_FILE"
 grep -q '^ANYTLS_DEDUP_ENABLED=1$' "$ANYTLS_ENV_FILE"
 cp "$ANYTLS_CONFIG_DIR/dedup.env" "$test_root/good-dedup.env"
 sed -i "s/^ANYTLS_DEDUP_DOMAINS=.*/ANYTLS_DEDUP_DOMAINS=''/" "$ANYTLS_CONFIG_DIR/dedup.env"
+# The list file is the allowlist once it exists, so an empty DOMAINS setting
+# is only a mistake while there is no file to migrate the list from.
+"$installer" "${dedup_args[@]}" >/dev/null
+grep -Eq "^ANYTLS_DEDUP_DOMAINS='?chatgpt[.]com,api[.]openai[.]com'?$" "$ANYTLS_CONFIG_DIR/dedup.env"
+cp "$ANYTLS_CONFIG_DIR/dedup-domains" "$test_root/good-dedup-domains"
+rm -f "$ANYTLS_CONFIG_DIR/dedup-domains"
+sed -i "s/^ANYTLS_DEDUP_DOMAINS=.*/ANYTLS_DEDUP_DOMAINS=''/" "$ANYTLS_CONFIG_DIR/dedup.env"
 expect_decoder_failure
 cp "$test_root/good-dedup.env" "$ANYTLS_CONFIG_DIR/dedup.env"
+cp "$test_root/good-dedup-domains" "$ANYTLS_CONFIG_DIR/dedup-domains"
 mkdir -p "$(dirname "$ANYTLS_DEDUP_RUNTIME_DIR")"
 printf unsafe >"$ANYTLS_DEDUP_RUNTIME_DIR"
 expect_decoder_failure
 [[ "$(cat "$ANYTLS_DEDUP_RUNTIME_DIR")" == unsafe ]]
 rm "$ANYTLS_DEDUP_RUNTIME_DIR"
+# An install from before the list file existed migrates its DOMAINS setting
+# into /etc/anytls/dedup-domains, and keeps the setting for older tooling.
+rm -f "$ANYTLS_CONFIG_DIR/dedup-domains"
+sed -i "s/^ANYTLS_DEDUP_DOMAINS=.*/ANYTLS_DEDUP_DOMAINS=chatgpt.com,api.example.test/" "$ANYTLS_CONFIG_DIR/dedup.env"
+"$installer" "${dedup_args[@]}" >/dev/null
+cmp -s "$ANYTLS_CONFIG_DIR/dedup-domains" <(printf '%s\n' chatgpt.com api.example.test)
+grep -Eq "^ANYTLS_DEDUP_DOMAINS='?chatgpt[.]com,api[.]example[.]test'?$" "$ANYTLS_CONFIG_DIR/dedup.env"
+grep -Fq -- "-domains-file $ANYTLS_CONFIG_DIR/dedup-domains" "$ANYTLS_DEDUP_SYSTEMD_UNIT"
+[[ "$(stat -c %a "$ANYTLS_CONFIG_DIR/dedup-domains")" == 640 ]]
+# Once the file is there, it is the list: a domain added to it survives an
+# upgrade of any other setting, and the deployment renders it into the unit.
+printf '%s\n' api.deepseek.com >>"$ANYTLS_CONFIG_DIR/dedup-domains"
+cp "$ANYTLS_CONFIG_DIR/dedup-domains" "$test_root/domains-before.sha"
+snapshot_decoder_install >"$test_root/before.sha"
+sed -i "s/^ANYTLS_DEDUP_MAX_BODY_MIB=.*/ANYTLS_DEDUP_MAX_BODY_MIB=32/" "$ANYTLS_CONFIG_DIR/dedup.env"
+snapshot_decoder_install >"$test_root/after.sha"
+if cmp -s "$test_root/before.sha" "$test_root/after.sha"; then
+  echo 'the edited decoder configuration did not change' >&2; exit 1
+fi
+"$installer" "${dedup_args[@]}" >/dev/null
+cmp -s "$ANYTLS_CONFIG_DIR/dedup-domains" "$test_root/domains-before.sha"
+grep -q '^ANYTLS_DEDUP_MAX_BODY_MIB=32$' "$ANYTLS_CONFIG_DIR/dedup.env"
+# A failed deployment restores the list file along with the rest.
+printf '%s\n' rollback.test >"$ANYTLS_CONFIG_DIR/dedup-domains"
+cp "$ANYTLS_CONFIG_DIR/dedup-domains" "$test_root/domains-rollback.sha"
+for injected in "$MOCK_DEDUP_FAIL_RESTART_ONCE" "$MOCK_DEDUP_HEALTH_FAIL"; do
+  touch "$injected"
+  expect_decoder_failure
+  cmp -s "$ANYTLS_CONFIG_DIR/dedup-domains" "$test_root/domains-rollback.sha"
+  rm -f "$injected"
+done
+# A path that is not a plain file is refused instead of replaced.
+rm -f "$ANYTLS_CONFIG_DIR/dedup-domains"
+mkdir -p "$ANYTLS_CONFIG_DIR/dedup-domains"
+if "$installer" "${dedup_args[@]}" >"$test_root/expected-failure.log" 2>&1; then
+  echo 'a directory as decoder domains file was accepted' >&2; exit 1
+fi
+grep -q 'unsafe dedup domains file path' "$test_root/expected-failure.log"
+[[ -d "$ANYTLS_CONFIG_DIR/dedup-domains" ]]
+rmdir "$ANYTLS_CONFIG_DIR/dedup-domains"
+"$installer" "${dedup_args[@]}" >/dev/null
+# Recreated from the setting it was migrated from, comments and the added
+# domain included.
+cmp -s "$ANYTLS_CONFIG_DIR/dedup-domains" <(printf '%s\n' chatgpt.com api.example.test api.deepseek.com)
 "$installer" uninstall --non-interactive >/dev/null
 [[ ! -e "$ANYTLS_DEDUP_BIN_PATH" && ! -e "$ANYTLS_DEDUP_SYSTEMD_UNIT" && ! -e "$ANYTLS_PROBE_BIN_PATH" ]]
+[[ ! -e "$ANYTLS_CONFIG_DIR/dedup-domains" ]]
 [[ ! -e "$MOCK_SYSTEMCTL_ACTIVE.dedup" && ! -e "$MOCK_SYSTEMCTL_ENABLED.dedup" ]]
 "$installer" uninstall --non-interactive >/dev/null
 # A missing unit/config after an earlier cleanup does not prevent retry.

@@ -26,6 +26,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	M "github.com/sagernet/sing/common/metadata"
@@ -97,6 +98,10 @@ func runFront(args []string) {
 	oomScore := fs.Int("oom-score-adj", 500, "raise oom_score_adj to this so the kernel kills the front before the proxy (0 = leave)")
 	compressFlag := fs.String("compress", "auto", "CPU for content the decoder lacks: auto, huffman (cheaper) or off (cache only)")
 	probe := fs.Duration("probe-interval", 5*time.Second, "decoder health check interval")
+	reverse := fs.String("reverse", "", "plain HTTP listen address of the reverse entry, e.g. 192.168.8.1:10863; off unless set")
+	reverseOrigins := fs.String("reverse-origins", "", "file of upstreams the reverse entry may reach, one per line; SIGHUP reloads it")
+	reverseAllow := fs.String("reverse-allow", "", "comma-separated client networks the reverse entry serves; others are refused")
+	reverseAuth := fs.String("reverse-auth", "", "file with \"user:password\", the lane reverse requests share with intercepted traffic; SIGHUP reloads it")
 	drain := fs.Duration("drain", 30*time.Second, "on SIGTERM, time for open requests to finish; a successor may already listen")
 	linger := fs.Duration("linger", 0, "on SIGTERM, keep accepting this long first, for a successor started at the same time to bind")
 	fs.Parse(args)
@@ -152,10 +157,41 @@ func runFront(args []string) {
 			log.Fatal(err)
 		}
 	}()
+	var rln net.Listener
+	var rserver *http.Server
+	if *reverse != "" {
+		r, err := newReverseFront(f, reverseConfig{origins: *reverseOrigins, auth: *reverseAuth, allow: *reverseAllow})
+		if err != nil {
+			log.Fatal(err)
+		}
+		rln, err = bind(*reverse)
+		if err != nil {
+			log.Fatal(err)
+		}
+		rserver = &http.Server{Handler: r, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute}
+		log.Printf("dedup front reverse entry on %s for %s", *reverse, r.origins)
+		go func() {
+			if err := rserver.Serve(rln); !errors.Is(err, http.ErrServerClosed) {
+				log.Fatal(err)
+			}
+		}()
+		cfg := reverseConfig{origins: *reverseOrigins, auth: *reverseAuth, allow: *reverseAllow}
+		onHangup(func() error { return r.reload(cfg) })
+	}
 	untilSignal(*drain, func(ctx context.Context) {
 		time.Sleep(*linger)
 		ln.Close()
-		f.shutdown(ctx)
+		var drained sync.WaitGroup
+		if rln != nil {
+			// No new reverse connections, while the open ones drain like
+			// the intercepted and relayed ones.
+			rln.Close()
+			drained.Add(1)
+			go func() { defer drained.Done(); rserver.Shutdown(ctx) }()
+		}
+		drained.Add(1)
+		go func() { defer drained.Done(); f.shutdown(ctx) }()
+		drained.Wait()
 	})
 }
 
@@ -221,7 +257,8 @@ func probeLoop(enc *encoder, decoder *url.URL, interval time.Duration, probed ch
 func runBack(args []string) {
 	fs := flag.NewFlagSet("back", flag.ExitOnError)
 	listen := fs.String("listen", "", "listen address, host:port or unix:/path")
-	domains := fs.String("domains", "", "comma-separated origins requests may name")
+	domains := fs.String("domains", "", "comma-separated origins requests may name; -domains-file instead reloads them on SIGHUP")
+	domainsFile := fs.String("domains-file", "", "file of origins requests may name, one per line; SIGHUP reloads it, a file that does not parse keeps the list")
 	admin := fs.String("admin", "", "loopback address for GET /stats")
 	cacheMiB := fs.Int64("cache-mib", 256, "chunk bytes kept; they cost about 1.25x this")
 	maxBodyMiB := fs.Int64("max-body-mib", 64, "largest body that is deduplicated")
@@ -267,7 +304,9 @@ func runBack(args []string) {
 	}
 	dec := newDecoder(up, *cacheMiB<<20, *maxBodyMiB<<20)
 	dec.inflight.limit = *inflightMiB << 20
-	dec.hosts = mustDomains(*domains)
+	if err := loadBackDomains(dec, *domains, *domainsFile); err != nil {
+		log.Fatal(err)
+	}
 	serveAdmin(*admin, dec.snapshot)
 
 	ln, err := bind(*listen)
@@ -275,7 +314,7 @@ func runBack(args []string) {
 		log.Fatal(err)
 	}
 	server := newDecoderServer(dec)
-	log.Printf("dedup back on %s for %s", *listen, strings.Join(dec.hosts, ","))
+	log.Printf("dedup back on %s for %s", *listen, strings.Join(dec.hostList(), ","))
 	go func() {
 		if err := server.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
@@ -283,6 +322,36 @@ func runBack(args []string) {
 	}()
 	// Meanwhile the front sends new requests straight to their origins.
 	untilSignal(*drain, func(ctx context.Context) { server.Shutdown(ctx) })
+}
+
+// loadBackDomains gives the decoder its origin list: -domains-file, reread on
+// SIGHUP, or the fixed -domains. Exactly one of them must be set.
+func loadBackDomains(dec *decoder, domains, domainsFile string) error {
+	switch {
+	case domains != "" && domainsFile != "":
+		return errors.New("-domains and -domains-file are exclusive")
+	case domainsFile != "":
+		dec.domains = newDomainSet(nil)
+		if err := dec.domains.load(domainsFile); err != nil {
+			return err
+		}
+		onHangup(func() error {
+			if err := dec.domains.load(domainsFile); err != nil {
+				return fmt.Errorf("domains not reloaded: %w", err)
+			}
+			log.Printf("domains reloaded: %s", dec.domains)
+			return nil
+		})
+		return nil
+	case domains != "":
+		list, err := parseDomains(domains)
+		if err != nil {
+			return fmt.Errorf("-domains: %w", err)
+		}
+		dec.hosts = list
+		return nil
+	}
+	return errors.New("-domains or -domains-file is required")
 }
 
 // serveAdmin serves GET /stats on addr, if set, and logs changes every minute.

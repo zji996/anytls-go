@@ -14,6 +14,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +27,7 @@ const (
 	hdrMissing = "X-Edge-Dedup-Missing" // 409: count of unknown references (hashes in body)
 	hdrReset   = "X-Edge-Dedup-Reset"   // 409: decoder restarted, drop the whole index
 	hdrH2C     = "X-Edge-Dedup-H2c"     // "1" on /health: the decoder also speaks HTTP/2 without TLS
+	hdrDomains = "X-Edge-Dedup-Domains" // on /health: the origins the decoder accepts
 )
 
 // dedupHost names the decoder itself; anytls servers route streams to it to
@@ -155,7 +157,11 @@ type encoder struct {
 	useH2 atomic.Bool
 	// zstdOK is set while the decoder can restore a zstd coding.
 	zstdOK atomic.Bool
-	stats  counters
+	// decoderDomains is the origin list the decoder last advertised on
+	// /health; nil while it advertised none (an older decoder), which lets
+	// the front fall back to its own intercept list.
+	decoderDomains atomic.Pointer[domainList]
+	stats          counters
 
 	// inflight may be shared by the encoders of several exits.
 	inflight *budget
@@ -312,6 +318,7 @@ func (e *encoder) probe(ctx context.Context, decoder *url.URL) {
 	if err != nil {
 		e.offerH2(false)
 		e.zstdOK.Store(false)
+		e.decoderDomains.Store(nil)
 		e.pause("decoder probe", err)
 		return
 	}
@@ -320,12 +327,41 @@ func (e *encoder) probe(ctx context.Context, decoder *url.URL) {
 	if epoch := resp.Header.Get(hdrEpoch); resp.StatusCode == http.StatusNoContent && epoch != "" {
 		e.offerH2(resp.Header.Get(hdrH2C) == "1")
 		e.zstdOK.Store(offersCoding(resp.Header.Get(hdrCodings), codingZstd))
+		e.learnDomains(resp.Header)
 		e.learnEpoch(epoch)
 		return
 	}
 	e.offerH2(false)
 	e.zstdOK.Store(false)
+	e.decoderDomains.Store(nil)
 	e.pause("decoder probe", errStatus(resp.StatusCode))
+}
+
+// learnDomains records the origins the decoder accepts, as its /health
+// advertised them. No header at all means an older decoder, which then gets
+// the front's own intercept list as before.
+func (e *encoder) learnDomains(header http.Header) {
+	values, present := header[http.CanonicalHeaderKey(hdrDomains)]
+	if !present {
+		e.decoderDomains.Store(nil)
+		return
+	}
+	list, err := parseDomains(strings.Join(values, ","))
+	if err != nil {
+		// An empty list accepts nothing, which is what the decoder does.
+		list = domainList{}
+	}
+	e.decoderDomains.Store(&list)
+}
+
+// accepts reports whether the decoder takes requests for host: only what it
+// advertised, or, when it advertised no list, what the local intercept list
+// covers (the behaviour of a decoder from before the list was advertised).
+func (e *encoder) accepts(host string, local domainList) bool {
+	if list := e.decoderDomains.Load(); list != nil {
+		return list.match(host)
+	}
+	return local.match(host)
 }
 
 func (e *encoder) offerH2(on bool) {
@@ -745,8 +781,10 @@ type decoder struct {
 	proxy    *httputil.ReverseProxy
 	stats    counters
 	misses   atomic.Int64
-	// hosts, if set, are the only origins requests may name.
-	hosts domainList
+	// hosts, if set, are the only origins requests may name; domains keeps
+	// the same list, which -domains-file may replace on SIGHUP.
+	hosts   domainList
+	domains *domainSet
 	// routes, if set, map each Host to its service; others are refused.
 	routes *routeTable
 	// h2c is set once a server that also speaks HTTP/2 without TLS serves it.
@@ -800,6 +838,23 @@ func newDecoder(upstream route, cacheBytes, maxBody int64) *decoder {
 	return d
 }
 
+// allowed reports whether requests may name host: a decoder without a list
+// accepts any host, as it always did.
+func (d *decoder) allowed(host string) bool {
+	if d.domains != nil {
+		return d.domains.match(host)
+	}
+	return d.hosts == nil || d.hosts.match(host)
+}
+
+// hostList is the origins the decoder accepts, for logging.
+func (d *decoder) hostList() []string {
+	if d.domains != nil {
+		return d.domains.get()
+	}
+	return d.hosts
+}
+
 // forward proxies r. Proxied answers get the epoch from ModifyResponse or
 // ErrorHandler, because relaying an upstream 1xx clears w.Header().
 func (d *decoder) forward(w http.ResponseWriter, r *http.Request) {
@@ -824,9 +879,17 @@ func (d *decoder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set(hdrH2C, "1")
 		}
 		w.Header().Set(hdrCodings, codingZstd)
+		// The front frames only what this list admits; an empty list
+		// advertises none, and a front that finds no header at all is
+		// talking to an older decoder.
+		if d.domains != nil {
+			w.Header().Set(hdrDomains, d.domains.String())
+		} else if d.hosts != nil {
+			w.Header().Set(hdrDomains, strings.Join(d.hosts, ","))
+		}
 		w.WriteHeader(http.StatusNoContent)
 		return
-	} else if d.hosts != nil && !d.hosts.match(host) {
+	} else if !d.allowed(host) {
 		log.Printf("refused %s %s for host %q", r.Method, r.URL.Path, r.Host)
 		http.Error(w, "host not allowed", http.StatusForbidden)
 		return

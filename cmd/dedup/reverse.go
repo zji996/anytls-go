@@ -132,7 +132,7 @@ func runDecode(args []string) {
 	dec := newDecoder(route{table: table}, *cacheMiB<<20, *maxBodyMiB<<20)
 	dec.inflight.limit = *inflightMiB << 20
 	serveAdmin(*admin, dec.snapshot)
-	go reloadOnHangup(table, *routes)
+	reloadOnHangup(table, *routes)
 
 	ln, err := bind(*listen)
 	if err != nil {
@@ -151,15 +151,28 @@ func runDecode(args []string) {
 // reloadOnHangup rereads the route file on SIGHUP. A file that does not parse
 // leaves the routes in use as they were.
 func reloadOnHangup(table *routeTable, path string) {
-	hup := make(chan os.Signal, 1)
-	signal.Notify(hup, syscall.SIGHUP)
-	for range hup {
+	onHangup(func() error {
 		if err := table.load(path); err != nil {
-			log.Printf("routes not reloaded: %v", err)
-			continue
+			return fmt.Errorf("routes not reloaded: %w", err)
 		}
 		log.Printf("routes reloaded: %s", strings.Join(table.hosts(), ","))
-	}
+		return nil
+	})
+}
+
+// onHangup runs reload on every SIGHUP, logging the error it returns. It
+// registers before it returns: a SIGHUP nobody has asked for ends a Go
+// program, so a reload sent right after start must not find it unregistered.
+func onHangup(reload func() error) {
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			if err := reload(); err != nil {
+				log.Print(err)
+			}
+		}
+	}()
 }
 
 // routeTable maps a request's Host to the plain HTTP service behind it.

@@ -666,7 +666,10 @@ rollback_install() {
   else
     systemctl disable "$service_name" >/dev/null 2>&1 || true
   fi
-  if [[ "$service_was_active" -eq 1 ]]; then
+  if [[ "$service_was_active" -eq 1 && "${main_restarted:-1}" -eq 0 ]]; then
+    # Never restarted: it still runs the files just restored.
+    wait_for_service_stable || rollback_failed=1
+  elif [[ "$service_was_active" -eq 1 ]]; then
     if ! systemctl restart "$service_name" >/dev/null 2>&1 || ! wait_for_service_stable; then
       rollback_failed=1
     fi
@@ -742,8 +745,31 @@ atomic_install() {
   fi
 }
 
+# same_file reports whether the installed file at $2 already holds the staged
+# $1, counting both absent as the same.
+same_file() {
+  if [[ -e "$1" || -e "$2" ]]; then
+    [[ -f "$1" && -f "$2" ]] && cmp -s "$1" "$2"
+  fi
+}
+
+# main_service_unchanged reports whether everything the running main service
+# was started from is already what is staged; restarting it would then only
+# drop every proxied connection for nothing.
+main_service_unchanged() {
+  local stage_dir="$1"
+  [[ "$service_was_active" -eq 1 ]] &&
+    same_file "$stage_dir/anytls-server" "$bin_path" &&
+    same_file "$stage_dir/server.env" "$env_file" &&
+    same_file "$stage_dir/server.password" "$password_file" &&
+    same_file "$stage_dir/padding.txt" "$config_dir/padding.txt" &&
+    same_file "$stage_dir/${service_name}.service" "$systemd_unit"
+}
+
 apply_staged_install() {
   local stage_dir="$1"
+  main_restarted=1
+  main_service_unchanged "$stage_dir" && main_restarted=0
   install -d -o root -g "$service_group" -m 0750 "$config_dir" || return 1
   install -d -m 0755 "$(dirname "$probe_path")" || return 1
   atomic_install "$stage_dir/anytls-server" "$bin_path" root root 0755 || return 1
@@ -763,9 +789,13 @@ apply_staged_install() {
   fi
 
   dedup_apply "$stage_dir" || return 1
-  if ! systemctl daemon-reload || ! systemctl enable "$service_name" || ! systemctl restart "$service_name" || ! wait_for_service_stable; then
-    return 1
+  systemctl daemon-reload && systemctl enable "$service_name" || return 1
+  if [[ "$main_restarted" -eq 0 ]]; then
+    echo "$service_name unchanged; not restarted"
+    wait_for_service_stable || return 1
+    return 0
   fi
+  systemctl restart "$service_name" && wait_for_service_stable || return 1
 }
 
 uri_encode() {
@@ -1348,7 +1378,7 @@ do_uninstall() {
   rm -f "$dedup_unit" "$dedup_bin" || return 1
   rm -f "$systemd_unit" "$bin_path" "$probe_path" || return 1
   rm -f "$env_file" "$password_file" "$config_dir/padding.txt" "$config_dir/user.managed" \
-    "$dedup_config" "$config_dir/dedup-user.managed" "$firewall_state_file" || return 1
+    "$dedup_config" "$dedup_domains_file" "$config_dir/dedup-user.managed" "$firewall_state_file" || return 1
   rmdir "$config_dir" 2>/dev/null || true
   systemctl daemon-reload || return 1
   if [[ "$remove_service_user" -eq 1 ]]; then

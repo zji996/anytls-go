@@ -43,6 +43,9 @@ type front struct {
 	maxConns                     int
 	open                         sync.WaitGroup
 	intercepted, passed, refused atomic.Int64
+	// Reverse entry: requests, those sent to the origin without dedup, and
+	// those refused before reaching an origin.
+	reverseReqs, reverseDirect, reverseRefused atomic.Int64
 }
 
 const peekTimeout = 10 * time.Second
@@ -387,6 +390,9 @@ func (f *front) snapshot() map[string]any {
 	s["intercepted_conns"] = f.intercepted.Load()
 	s["passed_conns"] = f.passed.Load()
 	s["refused_conns"] = f.refused.Load()
+	s["reverse_requests"] = f.reverseReqs.Load()
+	s["reverse_direct"] = f.reverseDirect.Load()
+	s["reverse_refused"] = f.reverseRefused.Load()
 	return s
 }
 
