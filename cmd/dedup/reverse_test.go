@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // reverseChain is client -> encode -> decode (routed) -> two services, as
@@ -145,5 +147,64 @@ func TestParseRoutesRejectsMistakes(t *testing.T) {
 	m, err := parseRoutes("\n# none yet\n")
 	if err != nil || len(m) != 0 {
 		t.Fatalf("an empty table: %v %v", m, err)
+	}
+}
+
+// A WebSocket crosses on an HTTP/1.1 connection of its own while frames share
+// HTTP/2, and framing stays on.
+func TestReverseCarriesWebSocketBesideHTTP2(t *testing.T) {
+	c := newReverseChain(t)
+	if !c.enc.useH2.Load() {
+		t.Fatal("the encoder did not find the decoder over HTTP/2")
+	}
+	conn, err := net.Dial("tcp", c.encSrv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	fmt.Fprint(conn, "GET /ws HTTP/1.1\r\nHost: a.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"+
+		"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade answered %d, want 101", resp.StatusCode)
+	}
+	fmt.Fprint(conn, "hello\n")
+	if line, err := br.ReadString('\n'); err != nil || line != "echo hello\n" {
+		t.Fatalf("after the upgrade read %q, %v", line, err)
+	}
+	if !c.enc.healthy() || !c.enc.useH2.Load() {
+		t.Fatal("a WebSocket paused framing or turned HTTP/2 off")
+	}
+	body := conversation(1, []string{image(100 << 10)})
+	if status, _ := c.post(t, "a.example", body); status != 200 || c.enc.snapshot()["framed"].(int64) != 1 {
+		t.Fatalf("after the WebSocket: status %d, %v", status, c.enc.snapshot())
+	}
+}
+
+// A client that gives up on a slow answer does not pause framing.
+func TestReverseClientCancelKeepsFraming(t *testing.T) {
+	c := newReverseChain(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	body := conversation(1, []string{image(100 << 10)})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.encSrv.URL+"/hang", bytes.NewReader(body))
+	req.Host = "a.example"
+	if resp, err := http.DefaultClient.Do(req); err == nil {
+		resp.Body.Close()
+		t.Fatal("the hanging request answered")
+	}
+	// The encoder sees the cancel after the client does.
+	deadline := time.Now().Add(2 * time.Second)
+	for c.enc.snapshot()["framed"].(int64) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if !c.enc.healthy() {
+		t.Fatal("a client cancel paused framing")
 	}
 }

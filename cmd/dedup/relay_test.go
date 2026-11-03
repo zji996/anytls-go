@@ -37,6 +37,29 @@ func (o *origin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Link", "</app.css>; rel=preload")
 		w.WriteHeader(http.StatusEarlyHints)
 	}
+	if r.URL.Path == "/ws" && r.Header.Get("Upgrade") == "websocket" {
+		// Switch protocols, then echo one line.
+		conn, rw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		rw.Flush()
+		if line, err := rw.ReadString('\n'); err == nil {
+			rw.WriteString("echo " + line)
+			rw.Flush()
+		}
+		return
+	}
+	if r.URL.Path == "/hang" {
+		// Answers only after the client has given up.
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+		return
+	}
 	if r.URL.Path == "/stream" {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: first\n\n")

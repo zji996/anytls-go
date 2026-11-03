@@ -221,7 +221,7 @@ func newEncoder(upstream route, indexBytes, maxBody int64) *encoder {
 		e.h2 = h2cTransport(t)
 	}
 	e.proxy.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		return e.roundTrip(e.toDecoder(), req)
+		return e.roundTrip(e.toDecoder(req), req)
 	})
 	e.proxy.ModifyResponse = func(resp *http.Response) error {
 		if epoch := resp.Header.Get(hdrEpoch); epoch != "" {
@@ -264,9 +264,10 @@ func h2cTransport(plain *http.Transport) *http.Transport {
 	return t
 }
 
-// toDecoder is the transport for requests to the decoder.
-func (e *encoder) toDecoder() http.RoundTripper {
-	if e.h2 != nil && e.useH2.Load() {
+// toDecoder is the transport for req to the decoder. An upgrade, such as a
+// WebSocket, needs a connection of its own: HTTP/2 cannot carry one.
+func (e *encoder) toDecoder(req *http.Request) http.RoundTripper {
+	if e.h2 != nil && e.useH2.Load() && req.Header.Get("Upgrade") == "" {
 		return e.h2
 	}
 	return e.base
@@ -307,7 +308,7 @@ func (e *encoder) probe(ctx context.Context, decoder *url.URL) {
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, decoder.JoinPath("/health").String(), nil)
 	req.Host = dedupHost
-	resp, err := e.toDecoder().RoundTrip(req)
+	resp, err := e.toDecoder(req).RoundTrip(req)
 	if err != nil {
 		e.offerH2(false)
 		e.zstdOK.Store(false)
@@ -582,7 +583,10 @@ func (e *encoder) roundTrip(base http.RoundTripper, req *http.Request) (*http.Re
 func (e *encoder) send(base http.RoundTripper, req *http.Request, framed *framedRequest) (*http.Response, error) {
 	resp, err := base.RoundTrip(req)
 	if err != nil {
-		e.pause("decoder request", err)
+		if req.Context().Err() == nil {
+			// A client that left says nothing about the decoder.
+			e.pause("decoder request", err)
+		}
 		if framed != nil {
 			// The decoder may never have read the frame. Should it have, the
 			// chunks only travel once more as literals.
