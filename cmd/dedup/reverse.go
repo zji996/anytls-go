@@ -44,7 +44,7 @@ func runEncode(args []string) {
 	drain := fs.Duration("drain", 30*time.Second, "on SIGTERM, time for open requests to finish")
 	imagesFlag := fs.String("images", imagesOff, "PNG data URLs: off, shadow (measure what WebP would save; requests are not changed) or webp (send them as WebP)")
 	imagesQuality := fs.Int("images-quality", 85, "WebP quality; every encoder in front of one origin must use the same")
-	imagesWait := fs.Duration("images-wait", 1500*time.Millisecond, "webp: how long a request waits for its new images; later ones go as PNG and stay PNG")
+	imagesWait := fs.Duration("images-wait", 2*time.Second, "webp: how long a request waits for its new images; later ones go as PNG and stay PNG")
 	imagesWorkers := fs.Int("images-workers", min(runtime.NumCPU(), 16), "background transcodes at a time, each on a thread of lower CPU priority")
 	fs.Parse(args)
 	if *listen == "" || *upstream == "" {
