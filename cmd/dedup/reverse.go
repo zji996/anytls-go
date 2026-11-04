@@ -37,7 +37,7 @@ func runEncode(args []string) {
 	maxBodyMiB := fs.Int64("max-body-mib", 64, "largest body that is deduplicated; larger ones pass through")
 	inflightMiB := fs.Int64("inflight-mib", 256, "memory for requests being deduplicated, 2x body + 2 MiB each; others pass through")
 	inflightWait := fs.Duration("inflight-wait", 3*time.Second, "how long a request may wait for -inflight-mib before it passes through")
-	memoryMiB := fs.Int64("memory-mib", 0, "Go soft memory limit (0 = index/8 + inflight + 64; GOMEMLIMIT overrides)")
+	memoryMiB := fs.Int64("memory-mib", 0, "Go soft memory limit (0 = index/8 + inflight + 64 + image budgets; GOMEMLIMIT overrides)")
 	oomScore := fs.Int("oom-score-adj", 500, "raise oom_score_adj to this so the kernel kills the encoder before the proxies (0 = leave)")
 	compressFlag := fs.String("compress", "auto", "CPU for content the decoder lacks: auto, huffman (cheaper) or off (cache only)")
 	probe := fs.Duration("probe-interval", 5*time.Second, "decoder health check interval")
@@ -45,7 +45,7 @@ func runEncode(args []string) {
 	imagesFlag := fs.String("images", imagesOff, "PNG data URLs: off, shadow (measure what WebP would save; requests are not changed) or webp (send them as WebP)")
 	imagesQuality := fs.Int("images-quality", 85, "WebP quality; every encoder in front of one origin must use the same")
 	imagesWait := fs.Duration("images-wait", 2*time.Second, "webp: how long a request waits for its new images; later ones go as PNG and stay PNG")
-	imagesWorkers := fs.Int("images-workers", min(runtime.NumCPU(), 16), "background transcodes at a time, each on a thread of lower CPU priority")
+	imagesWorkers := fs.Int("images-workers", min(runtime.NumCPU()*3/2, 16), "background transcodes at a time, each on a thread of lower CPU priority")
 	fs.Parse(args)
 	if *listen == "" || *upstream == "" {
 		log.Fatal("-listen and -upstream are required")
@@ -65,8 +65,10 @@ func runEncode(args []string) {
 	if *memoryMiB == 0 {
 		*memoryMiB = *indexMiB/8 + *inflightMiB + 64
 		if images != nil {
-			// Queued copies, one decoded image per worker, and the WebPs kept.
-			*memoryMiB += imageQueueMiB + int64(*imagesWorkers)*imageMaxDecodeMiB
+			// Native, -index-mib 896, webp: 864 MiB Go
+			// (112+256+64+64+240+128) and at most 144 MiB in libwebp,
+			// 1008 MiB in all, under the encoders' MemoryMax=1500M.
+			*memoryMiB += imageQueueMiB + imageDecodeGoMiB
 			if images.mode == imagesWebp {
 				*memoryMiB += imageCacheMiB
 			}

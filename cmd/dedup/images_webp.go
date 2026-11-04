@@ -13,6 +13,9 @@ import (
 // from loading a system libwebp instead: another version could encode the
 // same image to other bytes, and every host must agree byte for byte.
 
+// Only the native codec holds part of the decode budget outside Go.
+const imageDecodeGoMiB = imageDecodeBudgetMiB
+
 func webpTranscoder(quality int) (transcodeFunc, error) {
 	opts := webp.Options{Quality: quality, Method: webpMethod}
 	return func(b64 []byte) ([]byte, error) {

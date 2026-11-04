@@ -15,6 +15,9 @@ import (
 // Build with -tags dedupimages,nodynamic,webpnative and CGO_ENABLED=1;
 // nodynamic keeps the tests' gen2brain/webp reference on its WASM build.
 
+// Only the native codec holds part of the decode budget outside Go.
+const imageDecodeGoMiB = imageDecodeBudgetMiB * imageDecodeGoBytesPerPixel / imageDecodeBytesPerPixel
+
 func webpTranscoder(quality int) (transcodeFunc, error) {
 	return func(b64 []byte) ([]byte, error) {
 		img, err := decodePNGDataURL(b64)

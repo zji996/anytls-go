@@ -23,7 +23,7 @@ import (
 // libwebp adds its slow rate-distortion passes.
 const webpMethod = 2
 
-// imageMaxPixels bounds the memory one decode may take (4 bytes a pixel).
+// imageMaxPixels bounds the pixel count accepted by the codec.
 const imageMaxPixels = 40 << 20
 
 // webpMaxSide is the largest width or height WebP can store.
@@ -34,6 +34,13 @@ var errAnimated = errors.New("animated PNG")
 // decodePNGDataURL turns the base64 payload of a PNG data URL into the decoded
 // image.
 func decodePNGDataURL(b64 []byte) (stdimage.Image, error) {
+	w, h, err := pngHeaderSize(b64)
+	if err != nil {
+		return nil, err
+	}
+	if w > webpMaxSide || h > webpMaxSide || w*h > imageMaxPixels {
+		return nil, fmt.Errorf("image %dx%d too large", w, h)
+	}
 	raw := make([]byte, base64.StdEncoding.DecodedLen(len(b64)))
 	n, err := base64.StdEncoding.Decode(raw, b64)
 	if err != nil {

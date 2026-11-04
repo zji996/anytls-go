@@ -37,10 +37,6 @@ const (
 	imagesWebp   = "webp"
 )
 
-// imageMaxDecodeMiB is the memory budget per transcode worker: one decoded
-// image, its WebP and buffers.
-const imageMaxDecodeMiB = 200
-
 // imageQueueMiB bounds the copies of new images waiting for a worker. A
 // restart empties the size cache, and the first busy minutes then bring dozens
 // of new screenshots at once.
@@ -119,7 +115,7 @@ type imageCounters struct {
 	small, otherFormat, otherBytes atomic.Int64
 	// Each distinct image the pool transcoded.
 	distinct, distinctBytes, distinctWebp atomic.Int64
-	kept, failed, busy                    atomic.Int64
+	kept, failed, busy, tooLarge          atomic.Int64
 	nanos                                 atomic.Int64
 	// Bytes of the bodies that were looked at, images or not.
 	bodies, bodyBytes atomic.Int64
@@ -154,6 +150,7 @@ type imageStage struct {
 	transcode        transcodeFunc
 	jobs             chan *imageJob
 	stats            imageCounters
+	decodeBudget     imageDecodeBudget
 
 	mu         sync.Mutex
 	cache      *imageLRU // sha256 of the payload -> result
@@ -174,16 +171,17 @@ type imageConfig struct {
 // newImageStage starts the workers.
 func newImageStage(c imageConfig, transcode transcodeFunc) *imageStage {
 	s := &imageStage{
-		mode:       c.mode,
-		quality:    c.quality,
-		workers:    c.workers,
-		wait:       c.wait,
-		transcode:  transcode,
-		jobs:       make(chan *imageJob, c.queueBytes/imageMinB64+1),
-		cache:      newImageLRU(c.cacheBytes),
-		pending:    make(map[[32]byte]*imageJob),
-		queueLimit: c.queueBytes,
-		rate:       imageStartRate,
+		mode:         c.mode,
+		quality:      c.quality,
+		workers:      c.workers,
+		wait:         c.wait,
+		transcode:    transcode,
+		jobs:         make(chan *imageJob, c.queueBytes/imageMinB64+1),
+		cache:        newImageLRU(c.cacheBytes),
+		pending:      make(map[[32]byte]*imageJob),
+		queueLimit:   c.queueBytes,
+		rate:         imageStartRate,
+		decodeBudget: imageDecodeBudget{limit: imageDecodeBudgetMiB << 20},
 	}
 	for range c.workers {
 		go s.work()
@@ -252,7 +250,7 @@ func (s *imageStage) observe(body []byte) {
 		key := sha256.Sum256(b64)
 		s.mu.Lock()
 		r, ok := s.cache.get(key)
-		if !ok && s.pending[key] == nil && s.enqueueLocked(key, b64) == nil {
+		if !ok && s.pending[key] == nil && !s.settleTooLargeLocked(key, b64) && s.enqueueLocked(key, b64) == nil {
 			s.stats.busy.Add(1)
 		}
 		s.mu.Unlock()
@@ -264,10 +262,22 @@ func (s *imageStage) observe(body []byte) {
 
 // finishesInTimeLocked reports whether a new job of n bytes would be done within
 // left: the queue ahead is shared among the workers, the job itself is not.
+// The measured per-worker rate includes budget waits and CPU contention, so
+// oversubscribing cores does not multiply a fixed single-core throughput.
 func (s *imageStage) finishesInTimeLocked(n int, left time.Duration) bool {
 	ahead := float64(s.queued) / (s.rate * float64(s.workers))
 	own := float64(n) / s.rate
 	return time.Duration((ahead+own)*float64(time.Second)) <= left
+}
+
+// settleTooLargeLocked sheds images that cannot fit even with no other jobs.
+func (s *imageStage) settleTooLargeLocked(key [32]byte, b64 []byte) bool {
+	if imageDecodeEstimate(b64) <= s.decodeBudget.limit {
+		return false
+	}
+	s.stats.tooLarge.Add(1)
+	s.settlePNGLocked(key, len(b64))
+	return true
 }
 
 // settlePNGLocked fixes key as sent as PNG.
@@ -304,6 +314,10 @@ func (s *imageStage) rewrite(ctx context.Context, body []byte) []byte {
 		}
 		if job := s.pending[key]; job != nil {
 			waiting[key] = job
+			continue
+		}
+		if s.settleTooLargeLocked(key, b64) {
+			results[key] = imageResult{size: len(b64)}
 			continue
 		}
 		var job *imageJob
@@ -429,7 +443,12 @@ func (s *imageStage) work() {
 		s.queued -= len(job.b64)
 		s.mu.Unlock()
 		began := time.Now()
+		estimate := imageDecodeEstimate(job.b64)
+		if !s.decodeBudget.acquire(estimate, job.done) {
+			continue
+		}
 		r := s.measure(job.b64)
+		s.decodeBudget.release(estimate)
 		took := time.Since(began)
 		s.mu.Lock()
 		if took > 0 {
@@ -488,6 +507,7 @@ func (s *imageStage) snapshot() map[string]any {
 	s.mu.Unlock()
 	snap := map[string]any{
 		"mode": s.mode, "quality": s.quality, "workers": s.workers,
+		"decode_budget_mib": imageDecodeBudgetMiB, "too_large": st.tooLarge.Load(),
 		"bodies": st.bodies.Load(), "body_bytes": st.bodyBytes.Load(),
 		"seen": st.seen.Load(), "seen_bytes": st.seenBytes.Load(),
 		"known": st.known.Load(), "known_bytes": st.knownBytes.Load(), "known_webp_bytes": st.knownWebp.Load(),
